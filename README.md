@@ -1,4 +1,5 @@
 <p align="center">
+  <img src="assets/logo.svg" alt="Neko AI Assistant Logo" width="120">
   <h1 align="center">🤖 Neko AI Assistant for WHMCS</h1>
   <p align="center">
     <strong>AI-Powered Ticket Support with Google Gemini — Auto-Reply, Mood Detection, Customer Insights & Smart Escalation</strong>
@@ -18,6 +19,7 @@
 
 - [Overview](#-overview)
 - [Features](#-features)
+- [Screenshots](#-screenshots)
 - [Requirements](#-requirements)
 - [Installation](#-installation)
 - [Configuration](#-configuration)
@@ -89,6 +91,75 @@
 | **Analytics Dashboard** | Mood charts, activity graphs, confidence distribution, conversation logs |
 | **Admin Widget** | Real-time AI insights widget on WHMCS admin homepage |
 | **API Logs** | Full request/response logging with details modal |
+
+---
+
+## 📸 Screenshots
+
+### Admin Dashboard — Overview
+*Main dashboard with stats cards, mood distribution chart, and activity timeline*
+
+![Dashboard Overview](Images/1%20(1).png)
+
+### Analytics — Confidence Distribution & Performance
+*Confidence breakdown chart and API performance metrics*
+
+![Analytics Tab](Images/1%20(2).png)
+
+### Knowledge Base — QA Pairs Manager
+*Add and manage custom Q&A pairs for AI context*
+
+![Knowledge Base](Images/1%20(3).png)
+
+### Activity Logs — Recent AI Conversations
+*Full log of AI interactions with confidence scores and mood detection*
+
+![Activity Logs](Images/1%20(4).png)
+
+### API Logs — Request/Response Tracking
+*Detailed API call logs with HTTP codes, response times, and error tracking*
+
+![API Logs](Images/1%20(5).png)
+
+### Ticket Training
+*Train AI from historical resolved tickets with department filtering*
+
+![Ticket Training](Images/1%20(6).png)
+
+### Escalation Management
+*Track all escalated tickets with admin notification status and resolution*
+
+![Escalation Management](Images/1%20(7).png)
+
+### Admin Ticket View — AI Reply Dropdown
+*Rich AI reply dropdown with Generate, Rewrite Tone, Enhance, Language, Summarize, Triage, and KB Draft options*
+
+![Admin AI Reply Dropdown](Images/1%20(8).png)
+
+### Admin Ticket View — AI Processing
+*AI processing state with mood and confidence badges*
+
+![AI Processing](Images/1%20(9).png)
+
+### Client Area — AI Reply Dropdown
+*Customer-facing AI dropdown with Generate, Summarize, Rewrite Tone, Change Length, and Language options*
+
+![Client Area AI Dropdown](Images/1%20(10).png)
+
+### Live Agent Escalation — Customer Notification
+*Automated response when customer requests a live agent*
+
+![Live Agent Escalation Response](Images/1%20(11).png)
+
+### Module Configuration — Core Settings
+*API key, model selection, assistant name, confidence threshold, custom instructions*
+
+![Module Configuration Part 1](Images/1%20(12).png)
+
+### Module Configuration — Advanced Settings
+*Training, footer, customer insights, escalation, autopilot, and department settings*
+
+![Module Configuration Part 2](Images/1%20(13).png)
 
 ---
 
@@ -257,6 +328,10 @@ Access via **Addon Modules → Neko AI Assistant** for:
 - **🚨 Escalation Tab** — View all escalation logs
 - **🔧 API Logs** — Inspect every API call with request/response details
 
+| Dashboard | Analytics | Escalations |
+|-----------|-----------|-------------|
+| ![Dashboard](Images/1%20(1).png) | ![Analytics](Images/1%20(2).png) | ![Escalations](Images/1%20(7).png) |
+
 ---
 
 ## 👤 Client Area Features
@@ -268,6 +343,8 @@ Customers see an **AI Reply dropdown** on their ticket view with:
 - Language selection (Auto, English, Bangla)
 
 A helpful banner informs users: *"If you want a real agent to assist you, please write **'live agent'** in your reply."*
+
+![Client Area AI Dropdown](Images/1%20(10).png)
 
 ---
 
@@ -286,6 +363,8 @@ When a customer uses any of the **25+ trigger phrases**, the system:
 
 **Supported trigger phrases include:**
 `live agent` · `talk to admin` · `human support` · `real person` · `manager` · `supervisor` · `escalate` · `stop bot` · `no bot` · `i want a human` · and 15+ more
+
+![Live Agent Escalation Response](Images/1%20(11).png)
 
 ---
 
