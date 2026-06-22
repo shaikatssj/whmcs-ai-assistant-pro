@@ -1,0 +1,385 @@
+================================================================================
+              NEKO AI ASSISTANT — COMPLETE FEATURE LIST (v3.0)
+              নেকো এআই অ্যাসিস্ট্যান্ট — সম্পূর্ণ ফিচার তালিকা (v৩.০)
+================================================================================
+
+
+1. AI-POWERED AUTO-REPLY
+   এআই-চালিত স্বয়ংক্রিয় উত্তর
+--------------------------------------------------------------------------------
+   EN: Automatically generates intelligent ticket replies using Google Gemini AI
+       when a customer opens a new ticket or replies to an existing one. The AI
+       reads the customer message, understands intent, and crafts a professional
+       response — all without human intervention.
+
+   BN: যখন কোনো গ্রাহক নতুন টিকেট খোলেন বা পুরোনো টিকেটে উত্তর দেন, তখন
+       Google Gemini AI ব্যবহার করে স্বয়ংক্রিয়ভাবে বুদ্ধিমান উত্তর তৈরি করে।
+       AI গ্রাহকের বার্তা পড়ে, উদ্দেশ্য বোঝে এবং পেশাদার উত্তর তৈরি করে —
+       সব কিছু মানুষের হস্তক্ষেপ ছাড়াই।
+
+
+2. MOOD DETECTION & SENTIMENT ANALYSIS
+   মুড শনাক্তকরণ ও আবেগ বিশ্লেষণ
+--------------------------------------------------------------------------------
+   EN: Detects customer mood (angry, frustrated, urgent, satisfied, calm,
+       neutral) from their message text. Mood is displayed in admin ticket view
+       and tracked in analytics dashboard. Supports mood escalation tracking
+       across multiple replies.
+
+   BN: গ্রাহকের বার্তার টেক্সট থেকে মুড (রাগান্বিত, হতাশ, জরুরি, সন্তুষ্ট,
+       শান্ত, নিরপেক্ষ) শনাক্ত করে। মুড অ্যাডমিন টিকেট ভিউতে প্রদর্শিত হয়
+       এবং অ্যানালিটিক্স ড্যাশবোর্ডে ট্র্যাক করা হয়। একাধিক উত্তর জুড়ে
+       মুড এসকেলেশন ট্র্যাকিং সমর্থন করে।
+
+
+3. CONFIDENCE SCORING
+   কনফিডেন্স স্কোরিং
+--------------------------------------------------------------------------------
+   EN: Every AI response includes a confidence score (0-100%) indicating how
+       certain the AI is about its answer. Gemini AI returns this score as part
+       of its response. Only replies above the configurable confidence threshold
+       are sent automatically.
+
+   BN: প্রতিটি AI উত্তরে একটি কনফিডেন্স স্কোর (০-১০০%) থাকে যা নির্দেশ করে
+       AI তার উত্তর সম্পর্কে কতটা নিশ্চিত। Gemini AI এই স্কোরটি তার উত্তরের
+       অংশ হিসেবে ফেরত দেয়। শুধুমাত্র কনফিগারযোগ্য কনফিডেন্স থ্রেশহোল্ডের
+       উপরে থাকা উত্তরগুলোই স্বয়ংক্রিয়ভাবে পাঠানো হয়।
+
+
+4. LIVE AGENT / HUMAN ESCALATION
+   লাইভ এজেন্ট / মানব এসকেলেশন
+--------------------------------------------------------------------------------
+   EN: When a customer writes "live agent", "talk to admin", "human support", or
+       similar phrases (25+ trigger phrases supported), the AI immediately stops
+       auto-replying. The ticket is flagged as High Priority, an admin
+       escalation email is sent, and the customer receives a confirmation
+       message. The ticket remains in "Open" status — never marked "Answered".
+
+   BN: যখন কোনো গ্রাহক "live agent", "talk to admin", "human support" বা
+       একই ধরনের বাক্যাংশ লেখেন (২৫+ ট্রিগার ফ্রেজ সমর্থিত), AI তখনই
+       স্বয়ংক্রিয় উত্তর দেওয়া বন্ধ করে দেয়। টিকেটটি উচ্চ অগ্রাধিকার হিসেবে
+       চিহ্নিত হয়, অ্যাডমিনকে এসকেলেশন ইমেইল পাঠানো হয়, এবং গ্রাহক একটি
+       নিশ্চিতকরণ বার্তা পান। টিকেটটি "Open" স্ট্যাটাসে থাকে — কখনও
+       "Answered" হিসেবে চিহ্নিত হয় না।
+
+
+5. AUTOPILOT MODE (DEPARTMENT-BASED)
+   অটোপাইলট মোড (বিভাগ-ভিত্তিক)
+--------------------------------------------------------------------------------
+   EN: Restrict AI auto-replies to specific support departments by specifying
+       comma-separated department IDs. Tickets in other departments will not
+       receive AI replies, giving you full control over which areas the AI
+       handles.
+
+   BN: কমা-বিভাজিত বিভাগ আইডি উল্লেখ করে নির্দিষ্ট সাপোর্ট বিভাগে AI
+       স্বয়ংক্রিয় উত্তর সীমাবদ্ধ করুন। অন্যান্য বিভাগের টিকেটে AI উত্তর
+       দেবে না, যা আপনাকে AI কোন এলাকায় কাজ করবে তার উপর সম্পূর্ণ নিয়ন্ত্রণ
+       দেয়।
+
+
+6. AUTOPILOT DELAY (QUEUED REPLIES)
+   অটোপাইলট বিলম্ব (সারিবদ্ধ উত্তর)
+--------------------------------------------------------------------------------
+   EN: Configure a delay (in minutes) before the AI sends its auto-reply. This
+       gives human agents a window to respond first. Queued replies are processed
+       by the WHMCS cron job. If the delay is set to 0, replies are sent
+       instantly.
+
+   BN: AI তার স্বয়ংক্রিয় উত্তর পাঠানোর আগে একটি বিলম্ব (মিনিটে) কনফিগার
+       করুন। এটি মানব এজেন্টদের আগে উত্তর দেওয়ার সুযোগ দেয়। সারিবদ্ধ
+       উত্তরগুলো WHMCS ক্রন জব দ্বারা প্রক্রিয়া করা হয়। বিলম্ব ০ হলে উত্তর
+       তৎক্ষণাৎ পাঠানো হয়।
+
+
+7. COOLDOWN PROTECTION
+   কুলডাউন সুরক্ষা
+--------------------------------------------------------------------------------
+   EN: Prevents the AI from spamming tickets with duplicate replies. A 2-minute
+       cooldown is enforced between auto-replies for the same ticket. However,
+       "live agent" requests always bypass the cooldown so escalations are never
+       delayed.
+
+   BN: AI-কে ডুপ্লিকেট উত্তর দিয়ে টিকেট স্প্যাম করা থেকে বিরত রাখে। একই
+       টিকেটের জন্য স্বয়ংক্রিয় উত্তরের মধ্যে ২-মিনিটের কুলডাউন প্রয়োগ করা
+       হয়। তবে, "live agent" অনুরোধ সর্বদা কুলডাউন বাইপাস করে যাতে এসকেলেশন
+       কখনও বিলম্বিত না হয়।
+
+
+8. ADMIN TICKET UI — AI REPLY DROPDOWN
+   অ্যাডমিন টিকেট UI — AI উত্তর ড্রপডাউন
+--------------------------------------------------------------------------------
+   EN: In the WHMCS admin ticket view, a rich AI Reply dropdown button is
+       injected with the following options:
+       - Generate Reply: Create a fresh AI response
+       - Rewrite Tone: Formal, Professional, Technical, Friendly, Empathetic,
+         Firm/Direct
+       - Enhance Reply: Fix Grammar, Expand, Shorten, Translate, Standard Polish
+       - Language: Auto-Detect, English, Bangla
+       - Summarize Ticket
+       - Triage Ticket
+       - Generate KB Draft
+       Also includes a custom prompt input and live mood/confidence badges.
+
+   BN: WHMCS অ্যাডমিন টিকেট ভিউতে, নিম্নলিখিত অপশনসহ একটি সমৃদ্ধ AI Reply
+       ড্রপডাউন বাটন ইনজেক্ট করা হয়:
+       - রিপ্লাই জেনারেট: একটি নতুন AI উত্তর তৈরি
+       - টোন পুনর্লিখন: ফর্মাল, প্রফেশনাল, টেকনিক্যাল, ফ্রেন্ডলি, সহানুভূতিশীল,
+         দৃঢ়/সরাসরি
+       - রিপ্লাই উন্নতি: ব্যাকরণ সংশোধন, বিস্তারিত, সংক্ষিপ্ত, অনুবাদ,
+         স্ট্যান্ডার্ড পলিশ
+       - ভাষা: স্বয়ংক্রিয় সনাক্তকরণ, ইংরেজি, বাংলা
+       - টিকেট সারাংশ
+       - টিকেট ট্রায়াজ
+       - নলেজবেজ ড্রাফট তৈরি
+       এছাড়া কাস্টম প্রম্পট ইনপুট এবং লাইভ মুড/কনফিডেন্স ব্যাজ রয়েছে।
+
+
+9. CLIENT-AREA AI REPLY DROPDOWN
+   ক্লায়েন্ট-এরিয়া AI উত্তর ড্রপডাউন
+--------------------------------------------------------------------------------
+   EN: Customers can also use AI features from the client-side ticket view:
+       - Generate Reply, Summarize Ticket
+       - Rewrite Tone (Formal, Friendly, Empathetic, Firm)
+       - Change Length (Longer, Shorter, Polish)
+       - Language (Auto, English, Bangla)
+       Also includes a banner informing users how to request a live agent.
+
+   BN: গ্রাহকরা ক্লায়েন্ট-সাইড টিকেট ভিউ থেকেও AI ফিচার ব্যবহার করতে পারেন:
+       - রিপ্লাই জেনারেট, টিকেট সারাংশ
+       - টোন পুনর্লিখন (ফর্মাল, ফ্রেন্ডলি, সহানুভূতিশীল, দৃঢ়)
+       - দৈর্ঘ্য পরিবর্তন (দীর্ঘ, সংক্ষিপ্ত, পলিশ)
+       - ভাষা (স্বয়ংক্রিয়, ইংরেজি, বাংলা)
+       এছাড়া ব্যবহারকারীদের লাইভ এজেন্ট কীভাবে অনুরোধ করতে হয় তা জানানোর
+       ব্যানার রয়েছে।
+
+
+10. CUSTOMER INSIGHTS (PROFILE-AWARE AI)
+    কাস্টমার ইনসাইটস (প্রোফাইল-সচেতন AI)
+--------------------------------------------------------------------------------
+   EN: When enabled, the AI receives full customer context before generating a
+       reply: name, email, company, location, account status, total spending,
+       active products/services (with domains, billing cycles, next due dates),
+       active domains, ticket history (total, by status), and customer tenure.
+       This enables highly personalized responses.
+
+   BN: সক্রিয় করা হলে, AI উত্তর তৈরির আগে সম্পূর্ণ গ্রাহক প্রসঙ্গ পায়:
+       নাম, ইমেইল, কোম্পানি, অবস্থান, অ্যাকাউন্ট স্ট্যাটাস, মোট ব্যয়,
+       সক্রিয় পণ্য/সেবা (ডোমেইন, বিলিং সাইকেল, পরবর্তী পরিশোধের তারিখসহ),
+       সক্রিয় ডোমেইন, টিকেট ইতিহাস (মোট, স্ট্যাটাস অনুযায়ী), এবং গ্রাহকের
+       মেয়াদ। এটি অত্যন্ত ব্যক্তিগতকৃত উত্তর সক্ষম করে।
+
+
+11. TICKET TRAINING FROM HISTORY
+    ইতিহাস থেকে টিকেট ট্রেনিং
+--------------------------------------------------------------------------------
+   EN: Automatically learns from your resolved tickets. Extracts question/answer
+       pairs from historical tickets with admin replies, categorizes them
+       (billing, technical, account, hosting, domain, sales), calculates
+       relevance scores, and caches them. The AI uses this training data for
+       improved confidence scoring and context-aware responses.
+
+   BN: আপনার সমাধানকৃত টিকেট থেকে স্বয়ংক্রিয়ভাবে শেখে। অ্যাডমিন উত্তরসহ
+       ঐতিহাসিক টিকেট থেকে প্রশ্ন/উত্তর জোড়া বের করে, সেগুলোকে শ্রেণীবদ্ধ
+       করে (বিলিং, টেকনিক্যাল, অ্যাকাউন্ট, হোস্টিং, ডোমেইন, সেলস), প্রাসঙ্গিকতা
+       স্কোর গণনা করে এবং ক্যাশ করে। AI এই ট্রেনিং ডেটা ব্যবহার করে উন্নত
+       কনফিডেন্স স্কোরিং এবং প্রসঙ্গ-সচেতন উত্তরের জন্য।
+
+
+12. QA PAIRS KNOWLEDGE BASE
+    প্রশ্নোত্তর জোড়া নলেজ বেজ
+--------------------------------------------------------------------------------
+   EN: Manage custom Question & Answer pairs directly from the admin dashboard.
+       These Q&A pairs are injected into the AI's context so it can give
+       accurate, company-specific answers. Each pair has a priority level and
+       can be toggled active/inactive.
+
+   BN: অ্যাডমিন ড্যাশবোর্ড থেকে সরাসরি কাস্টম প্রশ্ন ও উত্তর জোড়া পরিচালনা
+       করুন। এই Q&A জোড়াগুলো AI-এর প্রসঙ্গে ইনজেক্ট করা হয় যাতে এটি সঠিক,
+       কোম্পানি-নির্দিষ্ট উত্তর দিতে পারে। প্রতিটি জোড়ার একটি অগ্রাধিকার
+       স্তর আছে এবং সক্রিয়/নিষ্ক্রিয় টগল করা যায়।
+
+
+13. WHMCS KNOWLEDGEBASE SEARCH
+    WHMCS নলেজবেজ সার্চ
+--------------------------------------------------------------------------------
+   EN: The AI automatically searches your WHMCS Knowledgebase articles for
+       relevant content when generating replies. It extracts keywords from
+       customer messages, matches them against KB titles and article content,
+       and includes the top results in the AI context for more accurate answers.
+
+   BN: উত্তর তৈরির সময় AI স্বয়ংক্রিয়ভাবে প্রাসঙ্গিক বিষয়বস্তুর জন্য আপনার
+       WHMCS নলেজবেজ আর্টিকেল অনুসন্ধান করে। গ্রাহকের বার্তা থেকে কীওয়ার্ড
+       বের করে, KB শিরোনাম এবং আর্টিকেল বিষয়বস্তুর সাথে মেলায়, এবং আরো
+       সঠিক উত্তরের জন্য AI প্রসঙ্গে শীর্ষ ফলাফল অন্তর্ভুক্ত করে।
+
+
+14. ADMIN NOTIFICATION EMAILS
+    অ্যাডমিন নোটিফিকেশন ইমেইল
+--------------------------------------------------------------------------------
+   EN: When a ticket is escalated, the system sends beautifully formatted HTML
+       email alerts to admins containing ticket ID, subject, customer name,
+       escalation reason, priority badge, and timestamp. Emails are sent via
+       both PHP mail() and the native WHMCS SendAdminEmail API for maximum
+       delivery reliability.
+
+   BN: যখন একটি টিকেট এসকেলেট হয়, সিস্টেম অ্যাডমিনদের কাছে সুন্দরভাবে
+       ফরম্যাট করা HTML ইমেইল অ্যালার্ট পাঠায় যাতে টিকেট আইডি, বিষয়, গ্রাহকের
+       নাম, এসকেলেশনের কারণ, অগ্রাধিকার ব্যাজ এবং টাইমস্ট্যাম্প থাকে। সর্বোচ্চ
+       ডেলিভারি নির্ভরযোগ্যতার জন্য PHP mail() এবং নেটিভ WHMCS SendAdminEmail
+       API উভয়ের মাধ্যমে ইমেইল পাঠানো হয়।
+
+
+15. ANALYTICS DASHBOARD
+    অ্যানালিটিক্স ড্যাশবোর্ড
+--------------------------------------------------------------------------------
+   EN: A beautiful admin dashboard (Addon Modules > Neko AI Assistant) with:
+       - Overview stats: Total AI replies, avg confidence, escalated tickets,
+         active QA pairs
+       - Mood Distribution Chart (Doughnut)
+       - Activity Over Time Chart (Line graph, last 7 days)
+       - Confidence Distribution Chart (Bar chart)
+       - Recent AI Conversations table
+       - API Call Logs with details modal
+       - QA Pair Management tab
+       - Training & Escalation tabs
+
+   BN: একটি সুন্দর অ্যাডমিন ড্যাশবোর্ড (Addon Modules > Neko AI Assistant):
+       - সারসংক্ষেপ পরিসংখ্যান: মোট AI উত্তর, গড় কনফিডেন্স, এসকেলেটেড
+         টিকেট, সক্রিয় QA জোড়া
+       - মুড ডিস্ট্রিবিউশন চার্ট (ডোনাট)
+       - সময়ের সাথে কার্যকলাপ চার্ট (লাইন গ্রাফ, শেষ ৭ দিন)
+       - কনফিডেন্স ডিস্ট্রিবিউশন চার্ট (বার চার্ট)
+       - সাম্প্রতিক AI কথোপকথন টেবিল
+       - বিশদ মডালসহ API কল লগ
+       - QA জোড়া ম্যানেজমেন্ট ট্যাব
+       - ট্রেনিং ও এসকেলেশন ট্যাব
+
+
+16. ADMIN HOME WIDGET
+    অ্যাডমিন হোম উইজেট
+--------------------------------------------------------------------------------
+   EN: A modern animated widget on the WHMCS admin dashboard showing real-time
+       AI insights: today's replies count, average confidence level, and
+       escalation overview — all at a glance with progress bars and 12-hour
+       time format.
+
+   BN: WHMCS অ্যাডমিন ড্যাশবোর্ডে একটি আধুনিক অ্যানিমেটেড উইজেট যা রিয়েল-টাইম
+       AI ইনসাইট দেখায়: আজকের উত্তর সংখ্যা, গড় কনফিডেন্স লেভেল, এবং
+       এসকেলেশন সারসংক্ষেপ — সবকিছু প্রগ্রেস বার এবং ১২-ঘণ্টার সময় ফরম্যাটসহ
+       এক নজরে।
+
+
+17. API CALL LOGGING & DEBUGGING
+    API কল লগিং ও ডিবাগিং
+--------------------------------------------------------------------------------
+   EN: Every Gemini API call is logged with: endpoint URL, request/response data,
+       HTTP status code, CURL errors, response time, and error details.
+       Supports retry logic (up to 3 attempts) with exponential backoff for
+       rate limiting (HTTP 429) and server errors (HTTP 503).
+
+   BN: প্রতিটি Gemini API কল লগ করা হয়: এন্ডপয়েন্ট URL, রিকোয়েস্ট/রেসপন্স
+       ডেটা, HTTP স্ট্যাটাস কোড, CURL ত্রুটি, রেসপন্স সময়, এবং ত্রুটির বিবরণ।
+       রেট লিমিটিং (HTTP 429) এবং সার্ভার ত্রুটি (HTTP 503) এর জন্য
+       এক্সপোনেনশিয়াল ব্যাকঅফসহ রিট্রাই লজিক (৩ প্রচেষ্টা পর্যন্ত) সমর্থন করে।
+
+
+18. CUSTOM AI INSTRUCTIONS
+    কাস্টম AI নির্দেশনা
+--------------------------------------------------------------------------------
+   EN: Define custom behavior for your AI through a textarea in module settings.
+       Your instructions are prepended to the system prompt while preserving the
+       mandatory JSON output format and confidence scoring requirements.
+
+   BN: মডিউল সেটিংসে একটি টেক্সটএরিয়ার মাধ্যমে আপনার AI-এর জন্য কাস্টম
+       আচরণ নির্ধারণ করুন। বাধ্যতামূলক JSON আউটপুট ফরম্যাট এবং কনফিডেন্স
+       স্কোরিং প্রয়োজনীয়তা সংরক্ষণ করার সময় আপনার নির্দেশনা সিস্টেম প্রম্পটে
+       যোগ করা হয়।
+
+
+19. CONFIGURABLE AI FOOTER
+    কনফিগারযোগ্য AI ফুটার
+--------------------------------------------------------------------------------
+   EN: Optionally append a custom footer to all AI-generated replies. Supports
+       Markdown formatting. Can optionally display the confidence percentage
+       (e.g., "Confidence: 87%") in the footer.
+
+   BN: ঐচ্ছিকভাবে সমস্ত AI-জেনারেটেড উত্তরে একটি কাস্টম ফুটার যোগ করুন।
+       মার্কডাউন ফরম্যাটিং সমর্থন করে। ঐচ্ছিকভাবে ফুটারে কনফিডেন্স শতাংশ
+       (যেমন, "Confidence: 87%") প্রদর্শন করতে পারে।
+
+
+20. TICKET STATUS CONTROL
+    টিকেট স্ট্যাটাস নিয়ন্ত্রণ
+--------------------------------------------------------------------------------
+   EN: Configure whether AI auto-replies mark tickets as "Answered" or keep them
+       "Open" via the Autopilot Ticket Status setting. Escalated tickets always
+       stay "Open" regardless of this setting.
+
+   BN: অটোপাইলট টিকেট স্ট্যাটাস সেটিংয়ের মাধ্যমে কনফিগার করুন AI স্বয়ংক্রিয়
+       উত্তর টিকেট "Answered" হিসেবে চিহ্নিত করবে নাকি "Open" রাখবে। এই
+       সেটিং নির্বিশেষে এসকেলেটেড টিকেট সর্বদা "Open" থাকে।
+
+
+21. MULTI-LANGUAGE SUPPORT
+    বহু-ভাষা সমর্থন
+--------------------------------------------------------------------------------
+   EN: AI can generate replies in multiple languages. Currently supports
+       Auto-Detect, English, and Bangla (বাংলা). Language can be selected per
+       reply in both admin and client areas.
+
+   BN: AI একাধিক ভাষায় উত্তর তৈরি করতে পারে। বর্তমানে স্বয়ংক্রিয় সনাক্তকরণ,
+       ইংরেজি এবং বাংলা সমর্থন করে। অ্যাডমিন এবং ক্লায়েন্ট উভয় এরিয়াতে
+       প্রতিটি উত্তরের জন্য ভাষা নির্বাচন করা যায়।
+
+
+22. TICKET CUSTOM FIELDS SUPPORT
+    টিকেট কাস্টম ফিল্ড সমর্থন
+--------------------------------------------------------------------------------
+   EN: The AI prompt automatically includes any custom field values attached to
+       the ticket, giving the AI additional context for more relevant responses.
+
+   BN: AI প্রম্পট স্বয়ংক্রিয়ভাবে টিকেটের সাথে সংযুক্ত যেকোনো কাস্টম ফিল্ড
+       মান অন্তর্ভুক্ত করে, যা AI-কে আরো প্রাসঙ্গিক উত্তরের জন্য অতিরিক্ত
+       প্রসঙ্গ প্রদান করে।
+
+
+23. CONVERSATION HISTORY CONTEXT
+    কথোপকথন ইতিহাস প্রসঙ্গ
+--------------------------------------------------------------------------------
+   EN: The AI considers the full ticket conversation history (previous replies)
+       when generating responses, ensuring continuity and context awareness
+       across the conversation thread.
+
+   BN: উত্তর তৈরির সময় AI সম্পূর্ণ টিকেট কথোপকথন ইতিহাস (পূর্ববর্তী উত্তর)
+       বিবেচনা করে, কথোপকথন থ্রেড জুড়ে ধারাবাহিকতা এবং প্রসঙ্গ সচেতনতা
+       নিশ্চিত করে।
+
+
+24. ESCALATION TRACKING & MANAGEMENT
+    এসকেলেশন ট্র্যাকিং ও ব্যবস্থাপনা
+--------------------------------------------------------------------------------
+   EN: All escalations are logged in a dedicated database table with: ticket ID,
+       client ID, reason, priority, admin notification status, email sent
+       timestamp, resolution status, and timestamps. Viewable from the admin
+       dashboard.
+
+   BN: সমস্ত এসকেলেশন একটি ডেডিকেটেড ডেটাবেজ টেবিলে লগ করা হয়: টিকেট আইডি,
+       ক্লায়েন্ট আইডি, কারণ, অগ্রাধিকার, অ্যাডমিন নোটিফিকেশন স্ট্যাটাস,
+       ইমেইল পাঠানোর টাইমস্ট্যাম্প, সমাধান স্ট্যাটাস এবং টাইমস্ট্যাম্প।
+       অ্যাডমিন ড্যাশবোর্ড থেকে দেখা যায়।
+
+
+25. GEMINI MODEL SELECTION
+    Gemini মডেল নির্বাচন
+--------------------------------------------------------------------------------
+   EN: Choose which Google Gemini model to use (e.g., gemini-1.5-flash,
+       gemini-2.0-flash, gemini-3.1-flash). Configurable from module settings.
+
+   BN: কোন Google Gemini মডেল ব্যবহার করবেন তা বেছে নিন (যেমন, gemini-1.5-flash,
+       gemini-2.0-flash, gemini-3.1-flash)। মডিউল সেটিংস থেকে কনফিগারযোগ্য।
+
+
+================================================================================
+                      Developed by AI Assistant Pro
+                              Version 3.0
+================================================================================
