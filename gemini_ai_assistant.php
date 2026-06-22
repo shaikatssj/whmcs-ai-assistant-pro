@@ -585,9 +585,11 @@ function display_admin_interface($vars)
                                 alt="Neko AI Logo" class="neko-logo">
                             Neko AI Assistant</h1>
                         <p class="text">AI-powered customer support automation with intelligent response generation</p>
-                        <div style="margin-top: 10px; display: inline-flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.1); padding: 5px 10px; border-radius: 5px;">
-                            <span style="font-size: 13px; font-weight: 500; color: #555;">Powered by</span>
-                            <img src="../modules/addons/gemini_ai_assistant/hostinoz.png" alt="Hostinoz" style="height: 24px;">
+                        <div style="margin-top: 10px; display: inline-flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.1); padding: 8px 12px; border-radius: 5px;">
+                            <span style="font-size: 14px; font-weight: 500; color: #555;">Powered by</span>
+                            <a href="https://hostinoz.com" target="_blank">
+                                <img src="../modules/addons/gemini_ai_assistant/hostinoz.png" alt="Hostinoz" style="height: 45px;">
+                            </a>
                         </div>
                     </div>
                     <div class="header-stats">
