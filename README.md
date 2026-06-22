@@ -2,8 +2,9 @@
   <img src="assets/logo.svg" alt="Neko AI Assistant Logo" width="120">
   <h1 align="center">🤖 Neko AI Assistant for WHMCS</h1>
   <p align="center">
-    <strong>AI-Powered Ticket Support with Google Gemini — Auto-Reply, Mood Detection, Customer Insights & Smart Escalation</strong><br>
-    <strong>Powered by</strong> <a href="https://hostinoz.com" target="_blank"><img src="hostinoz.png" alt="Hostinoz" width="180"></a>
+    <strong>AI-Powered Ticket Support with Google Gemini — Auto-Reply, Mood Detection, Customer Insights & Smart Escalation</strong><br><br>
+    <strong>Powered by</strong><br>
+    <a href="https://hostinoz.com" target="_blank"><img src="hostinoz.png" alt="Hostinoz" width="180"></a>
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/Version-3.0-blue?style=for-the-badge" alt="Version">
@@ -448,7 +449,8 @@ When a customer uses any of the **25+ trigger phrases**, the system:
 ---
 
 <p align="center">
-  <strong>Developed by AI Assistant Pro</strong><br>
-  <strong>Powered by</strong> <a href="https://hostinoz.com" target="_blank"><img src="hostinoz.png" alt="Hostinoz" width="180"></a><br>
+  <strong>Developed by AI Assistant Pro</strong><br><br>
+  <strong>Powered by</strong><br>
+  <a href="https://hostinoz.com" target="_blank"><img src="hostinoz.png" alt="Hostinoz" width="180"></a><br><br>
   <em>Neko AI Assistant v3.0 — Making Support Smarter 🐱</em>
 </p>
