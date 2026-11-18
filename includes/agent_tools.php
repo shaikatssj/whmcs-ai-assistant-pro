@@ -1756,3 +1756,192 @@ function neko_tool_escalate_to_human($ticket_id, $client_id, $reason, $diagnosti
         'reason' => $reason,
     ];
 }
+
+/**
+ * Client-safe self-service diagnostic snapshot (for Client Area submitticket & viewticket).
+ * Never exposes private admin notes, server credentials, or other clients' data.
+ */
+function neko_client_safe_diagnostics($client_id, $related_service = '', $domain_hint = '', $query_text = '')
+{
+    $client_id = (int) $client_id;
+    $findings = [];
+    $target_domain = neko_sanitize_domain((string) $domain_hint);
+    $services = [];
+    $unpaid_invoices = [];
+    $domains = [];
+
+    if ($client_id > 0) {
+        $svc_res = neko_tool_get_client_services($client_id, 'all');
+        $services = $svc_res['services'] ?? [];
+
+        $inv_res = neko_tool_get_client_invoices($client_id, 'Unpaid');
+        $unpaid_invoices = $inv_res['invoices'] ?? [];
+
+        $dom_res = neko_tool_get_client_domains($client_id);
+        $domains = $dom_res['domains'] ?? [];
+
+        // Parse WHMCS relatedservice selector ("S123" or "D45")
+        $rel = trim((string) $related_service);
+        if (preg_match('/^S(\d+)$/i', $rel, $m)) {
+            $sid = (int) $m[1];
+            foreach ($services as $s) {
+                if ((int) $s['service_id'] === $sid) {
+                    if ($target_domain === '' && !empty($s['domain'])) {
+                        $target_domain = neko_sanitize_domain($s['domain']);
+                    }
+                    $findings[] = [
+                        'type' => 'service',
+                        'status' => $s['status'],
+                        'label' => "{$s['product_name']}" . (!empty($s['domain']) ? " ({$s['domain']})" : ''),
+                        'detail' => $s['status'] === 'Suspended'
+                            ? ('Suspended' . (!empty($s['suspend_reason']) ? ": {$s['suspend_reason']}" : ''))
+                            : "Service status: {$s['status']} | Next Due: {$s['next_due_date']}",
+                    ];
+                }
+            }
+        } elseif (preg_match('/^D(\d+)$/i', $rel, $m)) {
+            $did = (int) $m[1];
+            foreach ($domains as $d) {
+                if ((int) $d->domain_id === $did) {
+                    if ($target_domain === '' && !empty($d->domain)) {
+                        $target_domain = neko_sanitize_domain($d->domain);
+                    }
+                    $findings[] = [
+                        'type' => 'domain',
+                        'status' => $d->status,
+                        'label' => $d->domain,
+                        'detail' => "Domain status: {$d->status} | Expiry: {$d->expirydate}",
+                    ];
+                }
+            }
+        }
+
+        // Flag any suspended/pending services or unpaid invoices automatically
+        foreach ($services as $s) {
+            if ($s['status'] === 'Suspended') {
+                $findings[] = [
+                    'type' => 'alert',
+                    'status' => 'Suspended',
+                    'label' => "Service #{$s['service_id']} ({$s['domain']})",
+                    'detail' => 'Service is Suspended' . (!empty($s['suspend_reason']) ? " ({$s['suspend_reason']})" : ''),
+                ];
+            }
+            if ($target_domain === '' && $s['status'] === 'Active' && !empty($s['domain'])) {
+                $target_domain = neko_sanitize_domain($s['domain']);
+            }
+        }
+
+        if (!empty($unpaid_invoices)) {
+            foreach (array_slice($unpaid_invoices, 0, 3) as $inv) {
+                $findings[] = [
+                    'type' => 'invoice',
+                    'status' => $inv['is_overdue'] ? 'Overdue' : 'Unpaid',
+                    'label' => "Invoice #{$inv['invoice_num']}",
+                    'detail' => "Amount: {$inv['total']} | Due: {$inv['due_date']}" . ($inv['is_overdue'] ? ' (OVERDUE)' : ''),
+                    'invoice_id' => $inv['invoice_id'],
+                ];
+            }
+        }
+    }
+
+    // Extract domain from query text if none selected yet
+    if ($target_domain === '' && preg_match('/\b([a-z0-9-]+\.(?:com|net|org|io|co|bd|uk|xyz|info|biz|dev|app|online|store|shop|tech)(?:\.[a-z]{2})?)\b/i', (string) $query_text, $dm)) {
+        $target_domain = neko_sanitize_domain($dm[1]);
+    }
+
+    // Run live DNS + HTTP/SSL check ONLY if client is logged in or verified ticket
+    $dns_check = null;
+    $http_ssl_check = null;
+    if ($target_domain !== '' && $client_id > 0) {
+        $dns_check = neko_tool_check_domain_dns($target_domain, $client_id);
+        $http_ssl_check = neko_tool_check_website_http_ssl($target_domain);
+    }
+
+    // Public KB search (safe for everyone)
+    $kb_matches = [];
+    if (trim((string) $query_text) !== '') {
+        $kb_res = neko_tool_search_knowledgebase($query_text);
+        $kb_matches = array_slice($kb_res['kb_articles'] ?? [], 0, 3);
+    }
+
+    return [
+        'ok' => true,
+        'target_domain' => $target_domain,
+        'findings' => $findings,
+        'services_count' => count($services),
+        'unpaid_invoices_count' => count($unpaid_invoices),
+        'dns' => $dns_check,
+        'http_ssl' => $http_ssl_check,
+        'kb_articles' => $kb_matches,
+    ];
+}
+
+/**
+ * Fast 0-token account & ticket copilot snapshot for the Admin Ticket View header strip.
+ */
+function neko_ticket_copilot_snapshot($ticket_id)
+{
+    $ticket_id = (int) $ticket_id;
+    $ticket = Capsule::table('tbltickets')->where('id', $ticket_id)->first();
+    if (!$ticket) {
+        return ['ok' => false, 'error' => 'Ticket not found'];
+    }
+
+    $client_id = (int) ($ticket->userid ?? 0);
+    $analysis = Capsule::table('mod_gemini_ticket_analysis')->where('ticket_id', $ticket_id)->first();
+
+    $overview = neko_tool_get_client_overview($client_id);
+    $services = ($client_id > 0) ? (neko_tool_get_client_services($client_id, 'all')['services'] ?? []) : [];
+    $unpaid = ($client_id > 0) ? (neko_tool_get_client_invoices($client_id, 'Unpaid')['invoices'] ?? []) : [];
+    $domains_list = ($client_id > 0) ? (neko_tool_get_client_domains($client_id)['domains'] ?? []) : [];
+
+    $domain_chips = [];
+    foreach ($services as $s) {
+        if (!empty($s['domain'])) {
+            $domain_chips[] = $s['domain'];
+        }
+    }
+    foreach ($domains_list as $d) {
+        if (!empty($d->domain)) {
+            $domain_chips[] = $d->domain;
+        }
+    }
+    $domain_chips = array_slice(array_values(array_unique($domain_chips)), 0, 5);
+
+    $unpaid_total = 0.0;
+    foreach ($unpaid as $u) {
+        $unpaid_total += (float) $u['total'];
+    }
+
+    $agent_action_count = 0;
+    try {
+        if (Capsule::schema()->hasTable('mod_gemini_agent_actions')) {
+            $agent_action_count = Capsule::table('mod_gemini_agent_actions')->where('ticket_id', $ticket_id)->count();
+        }
+    } catch (\Exception $e) {}
+
+    return [
+        'ok' => true,
+        'ticket_id' => $ticket_id,
+        'client_id' => $client_id,
+        'mood' => $analysis ? $analysis->mood : 'neutral',
+        'needs_human' => $analysis ? !empty($analysis->needs_human) : false,
+        'escalation_level' => $analysis ? (float) $analysis->escalation_level : 0.3,
+        'credit_balance' => $overview['credit_balance'] ?? 0.0,
+        'currency_prefix' => $overview['currency_prefix'] ?? '$',
+        'total_spent' => $overview['total_spent'] ?? 0.0,
+        'services' => array_map(function ($s) {
+            return [
+                'id' => $s['service_id'],
+                'name' => $s['product_name'],
+                'domain' => $s['domain'],
+                'status' => $s['status'],
+                'suspend_reason' => $s['suspend_reason'],
+            ];
+        }, array_slice($services, 0, 6)),
+        'unpaid_count' => count($unpaid),
+        'unpaid_total' => round($unpaid_total, 2),
+        'domain_chips' => $domain_chips,
+        'agent_action_count' => $agent_action_count,
+    ];
+}

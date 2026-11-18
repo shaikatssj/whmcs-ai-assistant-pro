@@ -7,10 +7,10 @@
     <a href="https://hostinoz.com" target="_blank"><img src="hostinoz.png" alt="Hostinoz" width="180"></a>
   </p>
   <p align="center">
-    <img src="https://img.shields.io/badge/Version-3.0-blue?style=for-the-badge" alt="Version">
-    <img src="https://img.shields.io/badge/WHMCS-8.x-green?style=for-the-badge" alt="WHMCS">
+    <img src="https://img.shields.io/badge/Version-4.0-blue?style=for-the-badge" alt="Version">
+    <img src="https://img.shields.io/badge/WHMCS-8.x%20%2F%209.x-green?style=for-the-badge" alt="WHMCS">
     <img src="https://img.shields.io/badge/PHP-7.4%2B-purple?style=for-the-badge" alt="PHP">
-    <img src="https://img.shields.io/badge/Gemini-AI-orange?style=for-the-badge" alt="Gemini AI">
+    <img src="https://img.shields.io/badge/Gemini-AI%20Agent-orange?style=for-the-badge" alt="Gemini AI">
     <img src="https://img.shields.io/badge/License-Proprietary-red?style=for-the-badge" alt="License">
   </p>
 </p>
@@ -426,7 +426,20 @@ When a customer uses any of the **25+ trigger phrases**, the system:
 
 ## 📝 Changelog
 
-### v3.0 (Latest)
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+### v4.0 (Latest)
+- ✅ Autonomous Gemini `v1beta` function-calling agent (`includes/agent_runner.php`, `includes/agent_tools.php`)
+- ✅ Live diagnostics: full ticket thread, services (Active/Suspended/Pending), unpaid invoices, domains, module logs, DNS, HTTP/SSL, and cPanel/DirectAdmin checks
+- ✅ Guarded self-service & provisioning actions (resend emails, apply credit, domain NS/lock/EPP, paid unsuspend/provision/accept order, VPS power)
+- ✅ Uncertain-reply protection (`draft_note` saves private Admin Note instead of bothering customers)
+- ✅ Client Area Ticket Submit (`submitticket`) Instant Troubleshooter, Quick Issue Templates & Smart Ticket Writer
+- ✅ Client Area Ticket Reply (`viewticket`) Copilot with Live Service/DNS Check, Thread Summary, Log Formatter & Live Agent button
+- ✅ Admin Ticket Copilot with live Account Snapshot Strip, clickable Domain DNS/SSL chips, Staff Output Panel & 1-click Escalation Reset
+- ✅ Agent Actions Audit Log & Agent Diagnostic Bench in Admin Dashboard
+- ✅ Fixed `get_gemini_config()`, Nowdoc JS rendering, `.md-editor` toolbar anchoring, and `mbstring` fallback
+
+### v3.0
 - ✅ Google Gemini AI integration
 - ✅ Auto-reply with confidence scoring
 - ✅ Mood detection & sentiment analysis
@@ -452,5 +465,5 @@ When a customer uses any of the **25+ trigger phrases**, the system:
   <strong>Developed by AI Assistant Pro</strong><br><br>
   <strong>Powered by</strong><br>
   <a href="https://hostinoz.com" target="_blank"><img src="hostinoz.png" alt="Hostinoz" width="180"></a><br><br>
-  <em>Neko AI Assistant v3.0 — Making Support Smarter 🐱</em>
+  <em>Neko AI Assistant v4.0 — Autonomous WHMCS Support Agent 🐱</em>
 </p>

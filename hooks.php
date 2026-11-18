@@ -228,7 +228,7 @@ add_hook('TicketUserReply', 1, function ($vars) {
     neko_handle_incoming_ticket_event($ticket_id, $message, false);
 });
 
-// Hook to add AI reply AJAX handler in admin area
+// Hook to add AI reply & Copilot AJAX handlers in admin area
 add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
     if ($vars['filename'] == 'supporttickets' && isset($_POST['action'])) {
         $action = $_POST['action'];
@@ -241,7 +241,7 @@ add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
             $custom_prompt = $_POST['custom_prompt'] ?? '';
             $config = get_gemini_config();
 
-            // Fetch latest customer message (or fallback to initial ticket message) instead of ignoring replies
+            // Fetch latest customer message (or fallback to initial ticket message)
             $latest_message = Capsule::table('tblticketreplies')
                 ->where('tid', $ticket_id)
                 ->where('admin', '')
@@ -271,8 +271,20 @@ add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
                     ]);
                 }
             } else {
+                // For thread-level modes (summarize, triage, generate_kb, internal_handover), pass the full thread
+                $prompt_input = (string) $latest_message;
+                if (in_array($mode, ['summarize', 'triage', 'generate_kb', 'internal_handover'], true)) {
+                    $thread = neko_tool_get_ticket_thread($ticket_id, $config);
+                    if (!empty($thread['thread'])) {
+                        $lines = [];
+                        foreach ($thread['thread'] as $tmsg) {
+                            $lines[] = "[{$tmsg['date']} | {$tmsg['role']} | {$tmsg['author']}]:\n{$tmsg['message']}";
+                        }
+                        $prompt_input = implode("\n\n", $lines);
+                    }
+                }
                 $analysis = analyze_ticket_content((string) $latest_message, $ticket_id);
-                $ai_response = generate_ai_ticket_response((string) $latest_message, $ticket_id, $analysis, $mode, $current_message, $lang);
+                $ai_response = generate_ai_ticket_response($prompt_input, $ticket_id, $analysis, $mode, $current_message, $lang);
             }
 
             ob_clean();
@@ -291,110 +303,184 @@ add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
                 $latest_message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
             }
             $analysis = analyze_ticket_content((string) $latest_message, $ticket_id);
+            $snapshot = neko_ticket_copilot_snapshot($ticket_id);
 
             ob_clean();
             header('Content-Type: application/json');
-            echo json_encode(array_merge(['success' => true], $analysis));
+            echo json_encode(array_merge(['success' => true], $analysis, ['snapshot' => $snapshot]));
+            exit;
+        }
+
+        if ($action == 'neko_quick_dns_ssl_check') {
+            $domain = trim((string) ($_POST['domain'] ?? ''));
+            $ticket = Capsule::table('tbltickets')->where('id', $ticket_id)->first();
+            $client_id = (int) ($ticket->userid ?? 0);
+
+            $dns = neko_tool_check_domain_dns($domain, $client_id);
+            $http_ssl = neko_tool_check_website_http_ssl($domain);
+
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode([
+                'success' => !empty($dns['ok']),
+                'domain' => $dns['domain'] ?? $domain,
+                'dns' => $dns,
+                'http_ssl' => $http_ssl,
+                'error' => $dns['error'] ?? null,
+            ]);
+            exit;
+        }
+
+        if ($action == 'neko_save_admin_note') {
+            $note_text = trim((string) ($_POST['note'] ?? ''));
+            if ($ticket_id <= 0 || $note_text === '') {
+                ob_clean();
+                header('Content-Type: application/json');
+                echo json_encode(['success' => false, 'error' => 'Empty note or invalid ticket']);
+                exit;
+            }
+            $res = neko_local_api('AddTicketNote', [
+                'ticketid' => $ticket_id,
+                'message' => $note_text,
+            ]);
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode([
+                'success' => ($res['result'] ?? '') === 'success',
+                'error' => $res['message'] ?? null,
+            ]);
+            exit;
+        }
+
+        if ($action == 'neko_reset_ticket_escalation') {
+            Capsule::table('mod_gemini_ticket_analysis')
+                ->where('ticket_id', $ticket_id)
+                ->update(['needs_human' => 0, 'escalation_level' => 0.3]);
+            Capsule::table('mod_gemini_escalations')
+                ->where('ticket_id', $ticket_id)
+                ->where('resolved', false)
+                ->update(['resolved' => true, 'resolved_at' => date('Y-m-d H:i:s')]);
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode(['success' => true]);
             exit;
         }
     }
 });
 
-// Hook to inject AI reply UI in admin area
+// Hook to inject modern AI Support Copilot UI in admin ticket view
 add_hook('AdminAreaFooterOutput', 1, function ($vars) {
     if ($vars['filename'] == 'supporttickets' && isset($_GET['id'])) {
         $ticket_id = (int) $_GET['id'];
 
-        return <<<HTML
+        $html = <<<'HTML'
 <script>
 $(document).ready(function() {
-    if ($('.ai-reply-container').length > 0) return; // Prevent duplicate injection
-    
-    console.log("Gemini AI: Module script loaded. Checking for reply area...");
-    
+    if ($('#nekoAdminCopilot').length > 0) return;
+
     var target = $('#replymessage');
-    if (target.length === 0) {
-        target = $('#content'); // Fallback
-    }
-    
-    if (target.length === 0) {
-        console.warn("Gemini AI: Could not find #replymessage or #content. Checking for any textarea...");
-        target = $('textarea[name="replymessage"]');
-    }
-    
-    if (target.length === 0) {
-        console.error("Gemini AI: Target area not found. Dropdown will not be injected.");
-        return;
-    }
+    if (target.length === 0) target = $('#content');
+    if (target.length === 0) target = $('textarea[name="replymessage"]');
+    if (target.length === 0) return;
 
-    console.log("Gemini AI: Target found, injecting dropdown.");
-    
-    // Add AI reply dropdown to the ticket reply area with sub-menus for a cleaner UI
-    var aiDropdown = `
-        <div class="ai-reply-container" style="margin: 10px 0; display: inline-block;">
-            <div class="btn-group dropdown">
-                <button type="button" id="aiReplyBtn" class="btn btn-sm btn-info dropdown-toggle" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false" style="background-color: #31a7c5; border-color: #269abc; color: white; font-weight: bold;">
-                    <i class="fas fa-robot"></i> <span class="btn-text">🤖 AI Reply</span> <span class="caret"></span>
+    var insertAnchor = target.closest('.md-editor');
+    if (insertAnchor.length === 0) insertAnchor = target;
+
+    var copilotHtml = `
+        <div id="nekoAdminCopilot" class="neko-copilot-card">
+            <div class="neko-copilot-header">
+                <div class="neko-copilot-brand">
+                    <span class="neko-copilot-icon"><i class="fas fa-robot"></i></span>
+                    <div>
+                        <strong>Neko AI Support Copilot</strong>
+                        <span class="neko-copilot-sub">Autonomous WHMCS Diagnostics &amp; Reply Assistant</span>
+                    </div>
+                </div>
+                <div class="neko-copilot-badges">
+                    <span id="currentMood" class="label label-default">Mood: Analyzing...</span>
+                    <span id="confidenceBadge" class="label label-default">Confidence: ...</span>
+                    <span id="nekoUnpaidBadge" class="label label-default" style="display:none;"></span>
+                    <span id="nekoCreditBadge" class="label label-info" style="display:none;"></span>
+                    <span id="needsHumanBadge" class="label label-danger" style="display:none;">
+                        <i class="fas fa-exclamation-triangle"></i> Human Required
+                        <a href="javascript:void(0)" onclick="nekoResetEscalation()" title="Clear escalation & resume AI" style="color:#fff; margin-left:4px; text-decoration:underline;">Reset</a>
+                    </span>
+                </div>
+            </div>
+
+            <div id="nekoSnapshotStrip" class="neko-snapshot-strip" style="display:none;"></div>
+
+            <div class="neko-copilot-toolbar">
+                <button type="button" class="btn btn-sm neko-btn-primary" onclick="generateAIResponse('generate')">
+                    <i class="fas fa-stethoscope"></i> Diagnose &amp; Draft
                 </button>
-                <ul class="dropdown-menu multi-level" role="menu" aria-labelledby="dropdownMenu">
-                    <li><a href="javascript:void(0)" onclick="generateAIResponse('generate')"><i class="fas fa-stethoscope"></i> Diagnose & Draft Reply (Read-Only)</a></li>
-                    <li><a href="javascript:void(0)" onclick="if(confirm('Allow Neko AI Agent to execute safe/configured WHMCS actions (if needed) and draft the reply?')) generateAIResponse('agent_solve')"><i class="fas fa-bolt"></i> Solve Issue & Draft Reply (Execute Actions)</a></li>
-                    
-                    <li class="dropdown-divider"></li>
-                    <li class="dropdown-submenu">
-                        <a tabindex="-1" href="javascript:void(0)"><i class="fas fa-pen-nib"></i> Rewrite Tone</a>
-                        <ul class="dropdown-menu">
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_formal')">Formal</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_professional')">Professional</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_technical')">Technical</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_friendly')">Friendly</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_empathetic')">Empathetic</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_firm')">Firm/Direct</a></li>
-                        </ul>
-                    </li>
+                <button type="button" class="btn btn-sm neko-btn-solve" onclick="if(confirm('Run Neko AI Agent with enabled WHMCS actions (unsuspend/email/domain) and draft the reply?')) generateAIResponse('agent_solve')">
+                    <i class="fas fa-bolt"></i> Auto-Solve &amp; Draft
+                </button>
+                <button type="button" class="btn btn-sm btn-default neko-btn-ghost" onclick="generateAIResponse('summarize')">
+                    <i class="fas fa-list-ul"></i> Summarize
+                </button>
+                <button type="button" class="btn btn-sm btn-default neko-btn-ghost" onclick="generateAIResponse('triage')">
+                    <i class="fas fa-search-plus"></i> Root-Cause Triage
+                </button>
+                <button type="button" class="btn btn-sm btn-default neko-btn-ghost" onclick="generateAIResponse('internal_handover')">
+                    <i class="fas fa-clipboard-check"></i> Handover Note
+                </button>
+                <button type="button" class="btn btn-sm btn-default neko-btn-ghost" onclick="generateAIResponse('generate_kb')">
+                    <i class="fas fa-book"></i> Draft KB
+                </button>
 
-                    <li class="dropdown-submenu">
-                        <a tabindex="-1" href="javascript:void(0)"><i class="fas fa-arrows-alt-h"></i> Enhance Reply</a>
-                        <ul class="dropdown-menu">
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_fix_grammar')">Fix Grammar</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_longer')">Expand / Make Longer</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_shorter')">Shorten</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_translate')">Translate...</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite')">Standard Polish</a></li>
-                        </ul>
-                    </li>
+                <div class="btn-group dropdown">
+                    <button type="button" id="aiReplyBtn" class="btn btn-sm btn-default dropdown-toggle neko-btn-ghost" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                        <i class="fas fa-pen-nib"></i> <span class="btn-text">Rewrite / Tone</span> <span class="caret"></span>
+                    </button>
+                    <ul class="dropdown-menu">
+                        <li class="dropdown-header">Tone</li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_empathetic')">Empathetic</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_professional')">Professional</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_technical')">Technical</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_friendly')">Friendly</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_formal')">Formal</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_firm')">Firm / Direct</a></li>
+                        <li class="divider dropdown-divider"></li>
+                        <li class="dropdown-header">Enhance</li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_fix_grammar')">Fix Spelling &amp; Grammar</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_shorter')">Make Shorter</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_longer')">Expand Detail</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite')">Standard Polish</a></li>
+                        <li><a href="javascript:void(0)" onclick="generateAIResponse('rewrite_translate')">Translate Draft...</a></li>
+                    </ul>
+                </div>
 
-                    <li class="dropdown-submenu">
-                        <a tabindex="-1" href="javascript:void(0)"><i class="fas fa-language"></i> Language</a>
-                        <ul class="dropdown-menu">
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('generate', 'auto')">Auto-Detect</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('generate', 'english')">English</a></li>
-                            <li><a href="javascript:void(0)" onclick="generateAIResponse('generate', 'bangla')">Bangla (বাংলা)</a></li>
-                        </ul>
-                    </li>
+                <select id="nekoAdminLang" class="form-control input-sm neko-lang-select" title="Reply language">
+                    <option value="auto">Lang: Auto</option>
+                    <option value="english">English</option>
+                    <option value="bangla">Bangla (বাংলা)</option>
+                </select>
 
-                    <li class="dropdown-divider"></li>
-                    <li><a href="javascript:void(0)" onclick="generateAIResponse('summarize')"><i class="fas fa-list-ul"></i> Summarize Ticket</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateAIResponse('triage')"><i class="fas fa-stethoscope"></i> Triage Ticket</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateAIResponse('generate_kb')"><i class="fas fa-book"></i> Generate KB Draft</a></li>
-                </ul>
+                <input type="text" id="aiCustomPrompt" class="form-control input-sm neko-custom-input" placeholder="Optional instruction (e.g. offer 10% credit, check MX)..." />
             </div>
-            <div class="custom-prompt-container" style="display: inline-block; margin-left: 10px; vertical-align: middle;">
-                <input type="text" id="aiCustomPrompt" class="form-control input-sm" placeholder="Custom instructions (optional)..." style="width: 250px; display: inline-block;" />
+
+            <div id="nekoCopilotStatus" class="neko-copilot-status" style="display:none;"></div>
+            <div id="nekoAgentTrace" class="neko-agent-trace" style="display:none;"></div>
+
+            <div id="nekoStaffPanel" class="neko-staff-panel" style="display:none;">
+                <div class="neko-staff-panel-head">
+                    <strong id="nekoStaffPanelTitle"><i class="fas fa-clipboard-list"></i> Copilot Output</strong>
+                    <div>
+                        <button type="button" class="btn btn-xs btn-default" onclick="nekoCopyStaffPanel()"><i class="fas fa-copy"></i> Copy</button>
+                        <button type="button" class="btn btn-xs btn-primary" onclick="nekoSaveStaffPanelAsNote()"><i class="fas fa-sticky-note"></i> Save Private Note</button>
+                        <button type="button" class="btn btn-xs btn-info" onclick="nekoInsertStaffPanelToReply()"><i class="fas fa-level-down-alt"></i> Put in Reply Box</button>
+                        <button type="button" class="btn btn-xs btn-link" onclick="$('#nekoStaffPanel').slideUp(150)"><i class="fas fa-times"></i></button>
+                    </div>
+                </div>
+                <pre id="nekoStaffPanelBody" class="neko-staff-panel-body"></pre>
             </div>
-            <div class="mood-display" style="display: inline-block; margin-left: 15px; vertical-align: middle;">
-                <span id="currentMood" class="label label-default" style="font-size: 11px; padding: 5px 10px;">Mood: Analyzing...</span>
-                <span id="confidenceBadge" class="label" style="font-size: 11px; padding: 5px 10px; margin-left: 5px;">Confidence: ...</span>
-            </div>
-            <div id="nekoAgentTrace" style="display: none; margin-top: 10px; padding: 10px 12px; background: #f4f8fb; border-left: 4px solid #31a7c5; border-radius: 4px; font-size: 12px;"></div>
         </div>
     `;
-    
-    // Position it before the reply content area (textarea)
-    target.before(aiDropdown);
-    
-    // Analyze current ticket mood
-    analyzeCurrentTicketMood({$ticket_id});
+
+    insertAnchor.before(copilotHtml);
+    analyzeCurrentTicketMood(__TICKET_ID__);
 });
 
 function nekoEscapeHtml(str) {
@@ -403,69 +489,82 @@ function nekoEscapeHtml(str) {
     });
 }
 
-function generateAIResponse(mode, lang) {
-    var ticketId = {$ticket_id};
+function nekoGetEditorHandles() {
     var replyArea = $('#replymessage');
-    if (replyArea.length === 0) replyArea = $('#content'); // Fallback
-    
-    var currentMessage = replyArea.val();
+    if (replyArea.length === 0) replyArea = $('#content');
+    if (replyArea.length === 0) replyArea = $('textarea[name="replymessage"]');
     var mde = replyArea.data('markdown');
-    
-    if (mde) {
-        currentMessage = mde.getContent();
+    return { area: replyArea, mde: mde };
+}
+
+function nekoSetReplyText(text) {
+    var h = nekoGetEditorHandles();
+    if (h.mde) {
+        h.mde.setContent(text);
+    } else {
+        h.area.val(text);
     }
-    
+}
+
+function nekoGetReplyText() {
+    var h = nekoGetEditorHandles();
+    return h.mde ? h.mde.getContent() : h.area.val();
+}
+
+function generateAIResponse(mode, lang) {
+    var ticketId = __TICKET_ID__;
+    var chosenLang = lang || $('#nekoAdminLang').val() || 'auto';
+    var currentMessage = nekoGetReplyText();
+    var staffModes = ['summarize', 'triage', 'generate_kb', 'internal_handover'];
+    var isStaffOnly = staffModes.indexOf(mode) !== -1;
+
     var customPrompt = $('#aiCustomPrompt').val() || '';
     if (mode === 'rewrite_translate') {
-        customPrompt = prompt("Which language should we translate this to?", "Spanish");
+        customPrompt = prompt("Translate draft into which language?", "Bengali");
         if (!customPrompt) return;
         customPrompt = "Translate this to " + customPrompt;
     }
-    
-    // Show loading state
+
     var originalContent = currentMessage;
-    var btn = $('#aiReplyBtn');
-    var btnText = btn.find('.btn-text');
-    var originalBtnHtml = btnText.html();
-    
-    btn.addClass('disabled').attr('disabled', 'disabled');
-    btnText.html('<i class="fas fa-spinner fa-spin"></i> Agent Investigating...');
+    var statusEl = $('#nekoCopilotStatus');
+    $('#nekoAdminCopilot button').prop('disabled', true);
+    statusEl.html('<i class="fas fa-spinner fa-spin"></i> Neko AI is analyzing ticket context &amp; running diagnostics...').show();
     $('#nekoAgentTrace').hide().empty();
 
-    if (mde) {
-        mde.setContent('Neko AI Agent is checking WHMCS data & diagnosing... Please wait.');
-    } else {
-        replyArea.val('Neko AI Agent is checking WHMCS data & diagnosing... Please wait.');
-        replyArea.attr('disabled', 'disabled');
+    if (!isStaffOnly) {
+        nekoSetReplyText('Neko AI Agent is checking WHMCS data & drafting reply... Please wait.');
     }
-    
+
     $.post('supporttickets.php', {
         action: 'generate_ai_reply',
         ticket_id: ticketId,
         reply_mode: mode,
-        reply_lang: lang || 'auto',
+        reply_lang: chosenLang,
         current_message: currentMessage,
         custom_prompt: customPrompt
     }, function(response) {
-        btn.removeClass('disabled').removeAttr('disabled');
-        btnText.html(originalBtnHtml);
+        $('#nekoAdminCopilot button').prop('disabled', false);
+        statusEl.hide();
 
-        if (!mde) {
-            replyArea.removeAttr('disabled');
-        }
-
-        if (response.success) {
-            if (mde) {
-                mde.setContent(response.response);
+        if (response && response.success) {
+            if (isStaffOnly) {
+                var titles = {
+                    summarize: 'Ticket Thread Summary',
+                    triage: 'Root-Cause Triage Checklist',
+                    generate_kb: 'Draft Knowledge Base Article',
+                    internal_handover: 'Internal Staff Handover Note'
+                };
+                $('#nekoStaffPanelTitle').html('<i class="fas fa-clipboard-list"></i> ' + (titles[mode] || 'Copilot Output'));
+                $('#nekoStaffPanelBody').text(response.response || '');
+                $('#nekoStaffPanel').slideDown(150);
             } else {
-                replyArea.val(response.response);
+                nekoSetReplyText(response.response);
             }
 
             if (response.mood && response.confidence !== undefined) {
                 updateMoodDisplay(response.mood, response.confidence, response.escalation_level || 0);
             }
 
-            // Render Agent Diagnostics & Tool Trace if present
             if ((response.tools_trace && response.tools_trace.length > 0) || response.internal_note || response.needs_human) {
                 var html = '<strong><i class="fas fa-microscope"></i> Neko Agent Diagnostics:</strong>';
                 if (response.needs_human) {
@@ -475,38 +574,118 @@ function generateAIResponse(mode, lang) {
                     }
                 }
                 if (response.internal_note) {
-                    html += '<div style="margin-top:5px; color:#2c3e50;">' + nekoEscapeHtml(response.internal_note) + '</div>';
+                    html += '<div style="margin-top:5px; color:#1f2937;">' + nekoEscapeHtml(response.internal_note) + '</div>';
                 }
                 if (response.tools_trace && response.tools_trace.length > 0) {
                     html += '<ul style="margin:6px 0 0 18px; padding:0;">';
                     response.tools_trace.forEach(function(tr) {
-                        var icon = tr.ok ? '<span style="color:#27ae60;">&#10004;</span>' : '<span style="color:#e74c3c;">&#10008;</span>';
+                        var icon = tr.ok ? '<span style="color:#16a34a;">&#10004;</span>' : '<span style="color:#dc2626;">&#10008;</span>';
                         html += '<li>' + icon + ' <code>' + nekoEscapeHtml(tr.tool) + '</code> &rarr; ' + nekoEscapeHtml(tr.summary) + '</li>';
                     });
                     html += '</ul>';
                 }
-                $('#nekoAgentTrace').html(html).show();
+                $('#nekoAgentTrace').html(html).slideDown(150);
             }
         } else {
-            if (mde) {
-                mde.setContent(originalContent);
-            } else {
-                replyArea.val(originalContent);
-            }
-            alert('AI Error: ' + response.error);
+            if (!isStaffOnly) nekoSetReplyText(originalContent);
+            alert('AI Error: ' + (response ? response.error : 'Unknown error'));
         }
     }, 'json').fail(function() {
-        btn.removeClass('disabled').removeAttr('disabled');
-        btnText.html(originalBtnHtml);
-        
-        if (!mde) replyArea.removeAttr('disabled');
-        if (mde) {
-            mde.setContent(originalContent);
-        } else {
-            replyArea.val(originalContent);
-        }
+        $('#nekoAdminCopilot button').prop('disabled', false);
+        statusEl.hide();
+        if (!isStaffOnly) nekoSetReplyText(originalContent);
         alert('Could not communicate with the AI module. Please try again.');
     });
+}
+
+function nekoRunQuickDomainDiag(domain) {
+    var statusEl = $('#nekoCopilotStatus');
+    statusEl.html('<i class="fas fa-spinner fa-spin"></i> Running live DNS, HTTP &amp; SSL check for <strong>' + nekoEscapeHtml(domain) + '</strong>...').show();
+    $.post('supporttickets.php', {
+        action: 'neko_quick_dns_ssl_check',
+        ticket_id: __TICKET_ID__,
+        domain: domain
+    }, function(res) {
+        statusEl.hide();
+        if (!res || !res.success) {
+            alert('Diagnostic error: ' + (res ? res.error : 'Failed'));
+            return;
+        }
+        var d = res.dns || {};
+        var recs = d.dns_records || {};
+        var cmp = d.whmcs_comparison || null;
+        var h = res.http_ssl || {};
+        var ssl = h.ssl_certificate || {};
+        var httpsCode = (h.http_checks && h.http_checks.https) ? h.http_checks.https.http_code : 0;
+        var httpCode = (h.http_checks && h.http_checks.http) ? h.http_checks.http.http_code : 0;
+
+        var lines = [
+            'LIVE DIAGNOSTIC REPORT: ' + res.domain,
+            '--------------------------------------------------',
+            'A Records   : ' + ((recs.A || []).join(', ') || 'None'),
+            'NS Records  : ' + ((recs.NS || []).join(', ') || 'None'),
+            'MX Records  : ' + ((recs.MX || []).join(', ') || 'None'),
+            'TXT Records : ' + ((recs.TXT || []).slice(0, 3).join(' | ') || 'None')
+        ];
+        if (cmp) {
+            lines.push('WHMCS Server IP : ' + (cmp.expected_server_ip || 'N/A') + ' (Matches A: ' + (cmp.a_record_matches_server ? 'YES' : 'NO') + ')');
+        }
+        lines.push('HTTP / HTTPS    : HTTP ' + httpCode + ' | HTTPS ' + httpsCode);
+        if (ssl && ssl.present) {
+            lines.push('SSL Certificate : CN=' + (ssl.subject_cn || '') + ' | Issuer=' + (ssl.issuer || '') + ' | Expires=' + (ssl.valid_to || '') + (ssl.is_expired ? ' [EXPIRED!]' : ' [VALID]'));
+        } else {
+            lines.push('SSL Certificate : Not reachable (' + (ssl.error || 'no cert') + ')');
+        }
+
+        $('#nekoStaffPanelTitle').html('<i class="fas fa-globe"></i> Live DNS &amp; SSL Check: ' + nekoEscapeHtml(res.domain));
+        $('#nekoStaffPanelBody').text(lines.join("\n"));
+        $('#nekoStaffPanel').slideDown(150);
+    }, 'json');
+}
+
+function nekoCopyStaffPanel() {
+    var txt = $('#nekoStaffPanelBody').text();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt);
+    } else {
+        var ta = $('<textarea>').val(txt).appendTo('body').select();
+        document.execCommand('copy');
+        ta.remove();
+    }
+    $('#nekoCopilotStatus').html('<i class="fas fa-check text-success"></i> Copied to clipboard.').show().delay(1800).fadeOut();
+}
+
+function nekoInsertStaffPanelToReply() {
+    var txt = $('#nekoStaffPanelBody').text();
+    nekoSetReplyText(txt);
+}
+
+function nekoSaveStaffPanelAsNote() {
+    var txt = $('#nekoStaffPanelBody').text();
+    if (!txt) return;
+    $.post('supporttickets.php', {
+        action: 'neko_save_admin_note',
+        ticket_id: __TICKET_ID__,
+        note: txt
+    }, function(res) {
+        if (res && res.success) {
+            $('#nekoCopilotStatus').html('<i class="fas fa-check text-success"></i> Saved as Private Admin Note on this ticket.').show().delay(2500).fadeOut();
+        } else {
+            alert('Failed to save note: ' + (res ? res.error : 'Unknown error'));
+        }
+    }, 'json');
+}
+
+function nekoResetEscalation() {
+    $.post('supporttickets.php', {
+        action: 'neko_reset_ticket_escalation',
+        ticket_id: __TICKET_ID__
+    }, function(res) {
+        if (res && res.success) {
+            $('#needsHumanBadge').hide();
+            $('#nekoCopilotStatus').html('<i class="fas fa-check text-success"></i> AI escalation cleared — Autopilot can resume on future replies.').show().delay(2500).fadeOut();
+        }
+    }, 'json');
 }
 
 function analyzeCurrentTicketMood(ticketId) {
@@ -514,20 +693,54 @@ function analyzeCurrentTicketMood(ticketId) {
         action: 'analyze_ticket_mood',
         ticket_id: ticketId
     }, function(response) {
-        if (response.success) {
+        if (response && response.success) {
             updateMoodDisplay(response.mood, response.confidence, response.escalation_level);
+            if (response.snapshot && response.snapshot.ok) {
+                renderSnapshotStrip(response.snapshot);
+            }
         }
     }, 'json');
+}
+
+function renderSnapshotStrip(snap) {
+    if (snap.needs_human) {
+        $('#needsHumanBadge').show();
+    }
+    if (snap.unpaid_count > 0) {
+        $('#nekoUnpaidBadge').removeClass('label-default').addClass('label-danger')
+            .text('Unpaid: ' + snap.unpaid_count + ' (' + snap.currency_prefix + snap.unpaid_total.toFixed(2) + ')').show();
+    } else if (snap.client_id > 0) {
+        $('#nekoUnpaidBadge').removeClass('label-danger').addClass('label-success').text('Invoices: Paid').show();
+    }
+    if (snap.credit_balance > 0) {
+        $('#nekoCreditBadge').text('Credit: ' + snap.currency_prefix + snap.credit_balance.toFixed(2)).show();
+    }
+
+    var parts = [];
+    if (snap.services && snap.services.length > 0) {
+        snap.services.slice(0, 4).forEach(function(s) {
+            var cls = s.status === 'Active' ? 'neko-chip-ok' : (s.status === 'Suspended' ? 'neko-chip-bad' : 'neko-chip-warn');
+            var label = nekoEscapeHtml(s.name) + (s.domain ? ' (' + nekoEscapeHtml(s.domain) + ')' : '') + ' · ' + nekoEscapeHtml(s.status);
+            parts.push('<span class="neko-chip ' + cls + '">' + label + '</span>');
+        });
+    }
+    if (snap.domain_chips && snap.domain_chips.length > 0) {
+        snap.domain_chips.forEach(function(dom) {
+            parts.push('<a href="javascript:void(0)" class="neko-chip neko-chip-diag" onclick="nekoRunQuickDomainDiag(\'' + nekoEscapeHtml(dom) + '\')" title="Run instant live DNS & SSL check"><i class="fas fa-stethoscope"></i> Check ' + nekoEscapeHtml(dom) + '</a>');
+        });
+    }
+    if (parts.length > 0) {
+        $('#nekoSnapshotStrip').html(parts.join(' ')).show();
+    }
 }
 
 function updateMoodDisplay(mood, confidence, escalation) {
     var moodLabel = $('#currentMood');
     var confidenceBadge = $('#confidenceBadge');
-    
+
     moodLabel.text('Mood: ' + mood.charAt(0).toUpperCase() + mood.slice(1));
     moodLabel.removeClass('label-default label-success label-info label-warning label-danger');
-    
-    // Style based on mood
+
     var moodStyles = {
         'angry': 'label-danger',
         'frustrated': 'label-warning',
@@ -536,12 +749,12 @@ function updateMoodDisplay(mood, confidence, escalation) {
         'calm': 'label-success',
         'neutral': 'label-info'
     };
-    moodLabel.addClass(moodStyles[mood.toLowerCase()] || 'label-info');
+    moodLabel.addClass(moodStyles[(mood || 'neutral').toLowerCase()] || 'label-info');
 
-    var confidencePercent = Math.round(confidence * 100);
+    var confidencePercent = Math.round((confidence || 0.5) * 100);
     confidenceBadge.text('Confidence: ' + confidencePercent + '%');
-    confidenceBadge.removeClass('label-danger label-warning label-success');
-    
+    confidenceBadge.removeClass('label-default label-danger label-warning label-success');
+
     if (confidencePercent >= 80) {
         confidenceBadge.addClass('label-success');
     } else if (confidencePercent >= 60) {
@@ -549,243 +762,729 @@ function updateMoodDisplay(mood, confidence, escalation) {
     } else {
         confidenceBadge.addClass('label-danger');
     }
-    
+
     if (escalation > 0.7) {
-        if ($('#needsHumanBadge').length === 0) {
-            confidenceBadge.after(' <span id="needsHumanBadge" class="label label-danger"><i class="fas fa-exclamation-triangle"></i> Escalated</span>');
-        }
+        $('#needsHumanBadge').show();
     }
 }
 </script>
 <style>
-.ai-reply-container {
-    padding: 12px;
-    background: #fdfdfd;
-    border: 1px solid #e1e4e8;
-    border-radius: 6px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    width: 100%;
+.neko-copilot-card {
+    margin: 12px 0;
+    background: #ffffff;
+    border: 1px solid #dbe4ee;
+    border-radius: 10px;
+    box-shadow: 0 3px 12px rgba(15, 23, 42, 0.06);
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
-.dropdown-submenu {
-    position: relative;
+.neko-copilot-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+    color: #fff;
 }
-.dropdown-submenu > .dropdown-menu {
-    top: 0;
-    left: 100%;
-    margin-top: -6px;
-    margin-left: -1px;
-    border-radius: 0 6px 6px 6px;
+.neko-copilot-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
-.dropdown-submenu:hover > .dropdown-menu {
+.neko-copilot-icon {
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: rgba(56, 189, 248, 0.22);
+    color: #38bdf8;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+}
+.neko-copilot-sub {
     display: block;
+    font-size: 11px;
+    color: #cbd5e1;
 }
-.dropdown-submenu > a:after {
-    display: block;
-    content: " ";
-    float: right;
-    width: 0;
-    height: 0;
-    border-color: transparent;
-    border-style: solid;
-    border-width: 5px 0 5px 5px;
-    border-left-color: #ccc;
-    margin-top: 5px;
-    margin-right: -10px;
+.neko-copilot-badges .label {
+    font-size: 11px;
+    padding: 4px 8px;
+    margin-left: 4px;
+    border-radius: 4px;
 }
-.dropdown-submenu:hover > a:after {
-    border-left-color: #fff;
+.neko-snapshot-strip {
+    padding: 8px 14px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
 }
-.dropdown-submenu.pull-left {
-    float: none;
+.neko-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid transparent;
 }
-.dropdown-submenu.pull-left > .dropdown-menu {
-    left: -100%;
-    margin-left: 10px;
-    border-radius: 6px 0 6px 6px;
+.neko-chip-ok { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
+.neko-chip-warn { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+.neko-chip-bad { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+.neko-chip-diag { background: #e0f2fe; color: #0369a1; border-color: #bae6fd; text-decoration: none; cursor: pointer; }
+.neko-chip-diag:hover { background: #bae6fd; text-decoration: none; color: #0c4a6e; }
+.neko-copilot-toolbar {
+    padding: 10px 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    background: #ffffff;
 }
-.dropdown-menu > li > a {
-    padding: 8px 15px;
-    font-size: 13px;
+.neko-btn-primary { background: #0284c7; color: #fff; border-color: #0369a1; font-weight: 600; }
+.neko-btn-primary:hover { background: #0369a1; color: #fff; }
+.neko-btn-solve { background: #059669; color: #fff; border-color: #047857; font-weight: 600; }
+.neko-btn-solve:hover { background: #047857; color: #fff; }
+.neko-btn-ghost { background: #f8fafc; border-color: #cbd5e1; color: #334155; font-weight: 500; }
+.neko-btn-ghost:hover { background: #e2e8f0; color: #0f172a; }
+.neko-lang-select { width: 120px !important; display: inline-block; height: 30px; }
+.neko-custom-input { flex: 1 1 200px; min-width: 180px; max-width: 320px; height: 30px; }
+.neko-copilot-status {
+    padding: 7px 14px;
+    background: #eff6ff;
+    border-top: 1px solid #dbeafe;
+    color: #1e40af;
+    font-size: 12px;
 }
-.dropdown-menu > li > a i {
-    width: 20px;
-    text-align: center;
-    margin-right: 8px;
-    color: #555;
+.neko-agent-trace {
+    padding: 10px 14px;
+    background: #f0f9ff;
+    border-top: 1px solid #bae6fd;
+    font-size: 12px;
+}
+.neko-staff-panel {
+    border-top: 1px solid #cbd5e1;
+    background: #f8fafc;
+}
+.neko-staff-panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 14px;
+    background: #e2e8f0;
+    color: #0f172a;
+    font-size: 12px;
+}
+.neko-staff-panel-body {
+    margin: 0;
+    padding: 12px 14px;
+    background: #ffffff;
+    border: none;
+    border-radius: 0;
+    max-height: 260px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    font-size: 12px;
+    color: #1e293b;
 }
 </style>
 HTML;
+
+        return str_replace('__TICKET_ID__', (string) $ticket_id, $html);
     }
 });
 
 
 // The AJAX request is now handled natively via gemini_ai_assistant_clientarea in the main module file.
 
-// Hook to inject AI reply UI in client area
+// Hook to inject modern AI Assistant UI in Client Area (Submit Ticket + View/Reply Ticket)
 add_hook('ClientAreaFooterOutput', 1, function ($vars) {
-    if ($vars['filename'] == 'viewticket') {
-        return <<<HTML
+    $filename = $vars['filename'] ?? '';
+    if ($filename !== 'viewticket' && $filename !== 'submitticket') {
+        return '';
+    }
+
+    $page_mode = $filename === 'submitticket' ? 'submit' : 'view';
+
+    $html = <<<'HTML'
 <script>
 $(document).ready(function() {
-    if ($('.client-ai-reply-container').length > 0) return; // Prevent duplicate injection
-    
-    // Check for standard WHMCS Six/Twenty-One theme reply area
+    var pageMode = '__PAGE_MODE__';
+    if ($('#nekoClientAssistant').length > 0) return;
+
     var target = $('#inputMessage');
-    if (target.length === 0) {
-        target = $('textarea[name="replymessage"]');
-    }
-    if (target.length === 0) {
-        target = $('textarea[name="message"]');
-    }
-    
-    if (target.length === 0) {
-        return; // No reply area found
-    }
+    if (target.length === 0) target = $('textarea[name="replymessage"]');
+    if (target.length === 0) target = $('textarea[name="message"]');
+    if (target.length === 0) return;
 
-    // Add alert about live agent
-    var alertBanner = '<div class="alert alert-info" style="margin-bottom: 15px;"><i class="fas fa-info-circle"></i> If you want a real agent to assist you, please write <strong>"live agent"</strong> or similar words in your reply.</div>';
-    
+    var insertAnchor = target.closest('.md-editor');
+    if (insertAnchor.length === 0) insertAnchor = target;
+
     var urlParams = new URLSearchParams(window.location.search);
-    var tidMask = urlParams.get('tid');
-    var ticketC = urlParams.get('c');
+    var tidMask = urlParams.get('tid') || '';
+    var ticketC = urlParams.get('c') || '';
 
-    var aiDropdown = `
-        <div class="client-ai-reply-container" style="margin-bottom: 15px; padding: 12px; background: #fdfdfd; border: 1px solid #e1e4e8; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); width: 100%;">
-            <div class="btn-group dropdown">
-                <button type="button" id="clientAiReplyBtn" class="btn btn-sm btn-info dropdown-toggle" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false" style="background-color: #31a7c5; border-color: #269abc; color: white; font-weight: bold;">
-                    <i class="fas fa-robot"></i> <span class="btn-text">🤖 AI Reply</span> <span class="caret"></span>
-                </button>
-                <ul class="dropdown-menu" role="menu" aria-labelledby="dropdownMenu" style="margin-top: 5px; max-height: 400px; overflow-y: auto; min-width: 200px;">
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('generate')"><i class="fas fa-magic"></i> Generate Reply</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('summarize')"><i class="fas fa-list-ul"></i> Summarize Ticket</a></li>
-                    
-                    <li class="dropdown-divider divider" style="margin: 8px 0; border-top: 1px solid #e5e5e5;"></li>
-                    <li class="dropdown-header" style="padding: 3px 15px; font-size: 11px; color: #777; text-transform: uppercase; font-weight: bold;"><i class="fas fa-pen-nib"></i> Rewrite Tone</li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite_formal')" style="padding-left: 25px;">Formal</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite_friendly')" style="padding-left: 25px;">Friendly</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite_empathetic')" style="padding-left: 25px;">Empathetic</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite_firm')" style="padding-left: 25px;">Firm/Direct</a></li>
-
-                    <li class="dropdown-divider divider" style="margin: 8px 0; border-top: 1px solid #e5e5e5;"></li>
-                    <li class="dropdown-header" style="padding: 3px 15px; font-size: 11px; color: #777; text-transform: uppercase; font-weight: bold;"><i class="fas fa-arrows-alt-h"></i> Change Length</li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite_longer')" style="padding-left: 25px;">Make Longer</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite_shorter')" style="padding-left: 25px;">Make Shorter</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('rewrite')" style="padding-left: 25px;">Standard Polish</a></li>
-
-                    <li class="dropdown-divider divider" style="margin: 8px 0; border-top: 1px solid #e5e5e5;"></li>
-                    <li class="dropdown-header" style="padding: 3px 15px; font-size: 11px; color: #777; text-transform: uppercase; font-weight: bold;"><i class="fas fa-language"></i> Language</li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('generate', 'auto')" style="padding-left: 25px;">Auto-Detect</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('generate', 'english')" style="padding-left: 25px;">English</a></li>
-                    <li><a href="javascript:void(0)" onclick="generateClientAIResponse('generate', 'bangla')" style="padding-left: 25px;">Bangla (বাংলা)</a></li>
-                </ul>
-            </div>
-        </div>
-    `;
-    
-    // Find the container for the reply textarea
-    var replyContainer = target.closest('.form-group');
-    if (replyContainer.length === 0) {
-        replyContainer = target.parent();
+    function getToken() {
+        return (typeof csrfToken !== 'undefined' ? csrfToken : ($('input[name="token"]').val() || ''));
     }
-    
-    replyContainer.before(alertBanner);
-    target.before(aiDropdown);
-    
-    window.generateClientAIResponse = function(mode, lang) {
-        var replyArea = target;
-        var currentMessage = replyArea.val();
-        
-        var mde = null;
-        if (typeof replyArea.data('markdown') !== 'undefined') {
-            mde = replyArea.data('markdown');
-            currentMessage = mde.getContent();
-        }
-        
-        var originalContent = currentMessage;
-        var btn = $('#clientAiReplyBtn');
-        var btnText = btn.find('.btn-text');
-        var originalBtnHtml = btnText.html();
-        
-        btn.addClass('disabled').attr('disabled', 'disabled');
-        btnText.html('<i class="fas fa-spinner fa-spin"></i> Processing...');
 
+    function getClientMde() {
+        return (typeof target.data('markdown') !== 'undefined') ? target.data('markdown') : null;
+    }
+
+    function getClientMessage() {
+        var mde = getClientMde();
+        return mde ? mde.getContent() : (target.val() || '');
+    }
+
+    function setClientMessage(txt) {
+        var mde = getClientMde();
         if (mde) {
-            mde.setContent('AI is processing your request... Please wait.');
+            mde.setContent(txt);
         } else {
-            replyArea.val('AI is processing your request... Please wait.');
-            replyArea.attr('disabled', 'disabled');
+            target.val(txt);
         }
-        
+    }
+
+    function esc(s) {
+        return String(s || '').replace(/[&<>"']/g, function(m) {
+            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+        });
+    }
+
+    var uiHtml = '';
+    if (pageMode === 'submit') {
+        uiHtml = `
+            <div id="nekoClientAssistant" class="neko-client-card">
+                <div class="neko-client-head">
+                    <div class="neko-client-title">
+                        <span class="neko-client-badge"><i class="fas fa-robot"></i></span>
+                        <div>
+                            <strong>Neko AI Instant Troubleshooter &amp; Ticket Writer</strong>
+                            <small>Check your service status, DNS &amp; SSL instantly—or let AI structure your issue clearly.</small>
+                        </div>
+                    </div>
+                    <select id="nekoClientLang" class="neko-client-select" title="Language">
+                        <option value="auto">Auto Language</option>
+                        <option value="english">English</option>
+                        <option value="bangla">Bangla (বাংলা)</option>
+                    </select>
+                </div>
+
+                <div class="neko-client-templates">
+                    <span class="neko-tpl-label">Quick Issue Templates:</span>
+                    <button type="button" class="neko-tpl-chip" onclick="nekoApplySubmitTemplate('site_down')"><i class="fas fa-exclamation-circle"></i> Website Down / 5xx</button>
+                    <button type="button" class="neko-tpl-chip" onclick="nekoApplySubmitTemplate('email')"><i class="fas fa-envelope"></i> Email Issue</button>
+                    <button type="button" class="neko-tpl-chip" onclick="nekoApplySubmitTemplate('ssl')"><i class="fas fa-lock"></i> SSL / HTTPS</button>
+                    <button type="button" class="neko-tpl-chip" onclick="nekoApplySubmitTemplate('dns')"><i class="fas fa-globe"></i> DNS / Nameservers</button>
+                    <button type="button" class="neko-tpl-chip" onclick="nekoApplySubmitTemplate('billing')"><i class="fas fa-file-invoice-dollar"></i> Billing / Invoice</button>
+                </div>
+
+                <div class="neko-client-actions">
+                    <button type="button" class="neko-cbtn neko-cbtn-diagnose" onclick="nekoClientSubmitDiagnose()">
+                        <i class="fas fa-stethoscope"></i> Instant Service &amp; DNS Check (Solve Now)
+                    </button>
+                    <button type="button" class="neko-cbtn neko-cbtn-primary" onclick="nekoClientSubmitAssist('polish_ticket')">
+                        <i class="fas fa-magic"></i> Polish My Description
+                    </button>
+                    <button type="button" class="neko-cbtn" onclick="nekoClientSubmitAssist('structure_bug_report')">
+                        <i class="fas fa-clipboard-list"></i> Structure Issue Details
+                    </button>
+                    <button type="button" class="neko-cbtn" onclick="nekoClientSubmitAssist('suggest_subject')">
+                        <i class="fas fa-heading"></i> Suggest Subject
+                    </button>
+                    <button type="button" class="neko-cbtn" onclick="nekoClientSubmitAssist('format_logs')">
+                        <i class="fas fa-code"></i> Format Error Logs
+                    </button>
+                </div>
+
+                <div id="nekoClientStatus" class="neko-client-status" style="display:none;"></div>
+                <div id="nekoClientResultPanel" class="neko-client-result" style="display:none;"></div>
+            </div>
+        `;
+    } else {
+        uiHtml = `
+            <div id="nekoClientAssistant" class="neko-client-card">
+                <div class="neko-client-head">
+                    <div class="neko-client-title">
+                        <span class="neko-client-badge"><i class="fas fa-robot"></i></span>
+                        <div>
+                            <strong>Neko AI Reply Assistant</strong>
+                            <small>Run a live service check, summarize this thread, or polish your message.</small>
+                        </div>
+                    </div>
+                    <div class="neko-client-head-right">
+                        <select id="nekoClientLang" class="neko-client-select" title="Language">
+                            <option value="auto">Auto Language</option>
+                            <option value="english">English</option>
+                            <option value="bangla">Bangla (বাংলা)</option>
+                        </select>
+                        <button type="button" class="neko-cbtn neko-cbtn-human" onclick="nekoClientRequestHuman()" title="Request a human support engineer">
+                            <i class="fas fa-user-headset"></i> Live Agent
+                        </button>
+                    </div>
+                </div>
+
+                <div class="neko-client-actions">
+                    <button type="button" class="neko-cbtn neko-cbtn-primary" onclick="generateClientAIResponse('generate')">
+                        <i class="fas fa-magic"></i> Suggest Reply
+                    </button>
+                    <button type="button" class="neko-cbtn neko-cbtn-diagnose" onclick="nekoClientViewDiagnose()">
+                        <i class="fas fa-stethoscope"></i> Run Live Service / DNS Check
+                    </button>
+                    <button type="button" class="neko-cbtn" onclick="generateClientAIResponse('summarize')">
+                        <i class="fas fa-list-ul"></i> Summarize Thread
+                    </button>
+                    <button type="button" class="neko-cbtn" onclick="generateClientAIResponse('format_logs')">
+                        <i class="fas fa-code"></i> Format Error Logs
+                    </button>
+
+                    <div class="neko-cmenu-wrap">
+                        <button type="button" class="neko-cbtn" onclick="$('#nekoClientToneMenu').toggle()">
+                            <i class="fas fa-pen-nib"></i> Rewrite / Polish <i class="fas fa-caret-down"></i>
+                        </button>
+                        <div id="nekoClientToneMenu" class="neko-cmenu" style="display:none;">
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite')">Clear &amp; Polite Polish</a>
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite_fix_grammar')">Fix Grammar</a>
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite_formal')">Formal Tone</a>
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite_friendly')">Friendly Tone</a>
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite_firm')">Firm / Urgent</a>
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite_shorter')">Make Shorter</a>
+                            <a href="javascript:void(0)" onclick="$('#nekoClientToneMenu').hide(); generateClientAIResponse('rewrite_longer')">Expand Details</a>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="nekoClientStatus" class="neko-client-status" style="display:none;"></div>
+                <div id="nekoClientResultPanel" class="neko-client-result" style="display:none;"></div>
+            </div>
+        `;
+    }
+
+    insertAnchor.before(uiHtml);
+
+    $(document).on('click', function(e) {
+        if (!$(e.target).closest('.neko-cmenu-wrap').length) {
+            $('#nekoClientToneMenu').hide();
+        }
+    });
+
+    function showClientStatus(msg) {
+        $('#nekoClientStatus').html('<i class="fas fa-spinner fa-spin"></i> ' + msg).show();
+    }
+
+    function hideClientStatus() {
+        $('#nekoClientStatus').hide();
+    }
+
+    function renderClientResultPanel(title, bodyHtml, insertText) {
+        var insertBtn = insertText
+            ? '<button type="button" class="neko-cbtn neko-cbtn-primary" id="nekoClientInsertBtn"><i class="fas fa-level-down-alt"></i> Insert into Message</button>'
+            : '';
+        var html = '<div class="neko-result-head"><strong>' + esc(title) + '</strong><div>' + insertBtn + ' <button type="button" class="neko-cbtn" onclick="$(\'#nekoClientResultPanel\').slideUp(150)">Close</button></div></div>' +
+                   '<div class="neko-result-body">' + bodyHtml + '</div>';
+        $('#nekoClientResultPanel').html(html).slideDown(150);
+        if (insertText) {
+            $('#nekoClientInsertBtn').on('click', function() {
+                var cur = getClientMessage().trim();
+                setClientMessage(cur ? (cur + "\n\n" + insertText) : insertText);
+            });
+        }
+    }
+
+    window.nekoApplySubmitTemplate = function(type) {
+        var templates = {
+            site_down: {
+                subject: 'Website Down / Returning Error on Domain: ',
+                body: "Affected Domain / URL: \nError Code or Message Seen (e.g. 500, 502, Connection Timed Out): \nWhen did the issue start?: \nRecent changes made (plugins, DNS, PHP version, etc.): \nSteps already tried: "
+            },
+            email: {
+                subject: 'Email Sending / Receiving Issue for: ',
+                body: "Affected Email Address(es): \nIssue Type (Cannot Send / Cannot Receive / Bounce Error): \nExact Bounce or SMTP Error Message: \nEmail Client Used (Webmail, Outlook, Apple Mail, Phone): "
+            },
+            ssl: {
+                subject: 'SSL / HTTPS Certificate Issue on: ',
+                body: "Domain / Subdomain: \nBrowser Warning / Error Message: \nUsing Cloudflare or Direct DNS?: \nWhen was the domain pointed to the server?: "
+            },
+            dns: {
+                subject: 'DNS / Nameserver Configuration Help for: ',
+                body: "Domain Name: \nWhat I am trying to point/configure (Website, MX, TXT/SPF, Subdomain): \nCurrent Nameservers / Records: "
+            },
+            billing: {
+                subject: 'Billing / Invoice Question - Invoice #',
+                body: "Related Invoice # or Service: \nPayment Method Used: \nTransaction ID / Date (if paid): \nDetails of my request: "
+            }
+        };
+        var tpl = templates[type];
+        if (!tpl) return;
+        var subjInput = $('#inputSubject');
+        if (subjInput.length === 0) subjInput = $('input[name="subject"]');
+        if (subjInput.length > 0 && !subjInput.val().trim()) {
+            subjInput.val(tpl.subject);
+        }
+        var cur = getClientMessage().trim();
+        if (!cur || confirm('Replace current message draft with this structured template?')) {
+            setClientMessage(tpl.body);
+        }
+    };
+
+    window.nekoClientSubmitDiagnose = function() {
+        var subj = ($('#inputSubject').val() || $('input[name="subject"]').val() || '');
+        var relSvc = ($('#inputRelatedService').val() || $('select[name="relatedservice"]').val() || '');
+        var msg = getClientMessage();
+
+        showClientStatus('Checking your service status, invoices, DNS, SSL &amp; Knowledge Base...');
         $.post('index.php?m=gemini_ai_assistant', {
-            token: (typeof csrfToken !== 'undefined' ? csrfToken : $('input[name="token"]').val()),
+            token: getToken(),
+            action: 'client_submit_diagnose',
+            related_service: relSvc,
+            subject: subj,
+            message: msg,
+            reply_lang: $('#nekoClientLang').val() || 'auto'
+        }, function(res) {
+            hideClientStatus();
+            if (!res || !res.success) {
+                alert('Diagnostic check could not complete: ' + (res ? res.error : 'Unknown error'));
+                return;
+            }
+            var body = '';
+            if (res.ai_guidance) {
+                body += '<div class="neko-diag-guidance">' + esc(res.ai_guidance).replace(/\n/g, '<br>') + '</div>';
+            }
+            if (res.findings && res.findings.length > 0) {
+                body += '<ul class="neko-diag-list">';
+                res.findings.forEach(function(f) {
+                    body += '<li><strong>' + esc(f.label) + ':</strong> ' + esc(f.detail) + '</li>';
+                });
+                body += '</ul>';
+            }
+            if (res.kb_articles && res.kb_articles.length > 0) {
+                body += '<div class="neko-kb-box"><strong>Helpful Knowledge Base Articles:</strong><ul>';
+                res.kb_articles.forEach(function(k) {
+                    body += '<li><strong>' + esc(k.title) + '</strong></li>';
+                });
+                body += '</ul></div>';
+            }
+            renderClientResultPanel('Instant Diagnostic & Self-Service Check', body || 'No issues detected on our end.', res.report_text || '');
+        }, 'json').fail(function() {
+            hideClientStatus();
+            alert('Could not run diagnostic check. Please try again.');
+        });
+    };
+
+    window.nekoClientSubmitAssist = function(mode) {
+        var subjEl = $('#inputSubject');
+        if (subjEl.length === 0) subjEl = $('input[name="subject"]');
+        var subj = subjEl.val() || '';
+        var msg = getClientMessage();
+
+        if (!msg.trim() && !subj.trim()) {
+            alert('Please type a short note or subject first so Neko AI can help improve it.');
+            return;
+        }
+
+        showClientStatus('Writing and clarifying your ticket...');
+        $.post('index.php?m=gemini_ai_assistant', {
+            token: getToken(),
+            action: 'client_submit_assist',
+            assist_mode: mode,
+            subject: subj,
+            message: msg,
+            reply_lang: $('#nekoClientLang').val() || 'auto'
+        }, function(res) {
+            hideClientStatus();
+            if (res && res.success) {
+                if (mode === 'suggest_subject' && subjEl.length > 0) {
+                    subjEl.val(res.response);
+                } else {
+                    setClientMessage(res.response);
+                }
+            } else {
+                alert('AI Error: ' + (res ? res.error : 'Unknown error'));
+            }
+        }, 'json').fail(function() {
+            hideClientStatus();
+            alert('Could not communicate with AI Assistant.');
+        });
+    };
+
+    window.nekoClientViewDiagnose = function() {
+        showClientStatus('Running live service, DNS &amp; SSL check for this ticket...');
+        $.post('index.php?m=gemini_ai_assistant', {
+            token: getToken(),
+            action: 'client_viewticket_diagnose',
+            tid_mask: tidMask,
+            c: ticketC,
+            reply_lang: $('#nekoClientLang').val() || 'auto'
+        }, function(res) {
+            hideClientStatus();
+            if (!res || !res.success) {
+                alert('Diagnostic error: ' + (res ? res.error : 'Unknown error'));
+                return;
+            }
+            var body = '';
+            if (res.ai_guidance) {
+                body += '<div class="neko-diag-guidance">' + esc(res.ai_guidance).replace(/\n/g, '<br>') + '</div>';
+            }
+            if (res.findings && res.findings.length > 0) {
+                body += '<ul class="neko-diag-list">';
+                res.findings.forEach(function(f) {
+                    body += '<li><strong>' + esc(f.label) + ':</strong> ' + esc(f.detail) + '</li>';
+                });
+                body += '</ul>';
+            }
+            renderClientResultPanel('Live Diagnostic Report', body || 'Checks completed.', res.report_text || '');
+        }, 'json').fail(function() {
+            hideClientStatus();
+            alert('Could not run live diagnostic.');
+        });
+    };
+
+    window.nekoClientRequestHuman = function() {
+        if (!confirm('Insert a request to speak directly with a human support engineer?')) return;
+        var cur = getClientMessage().trim();
+        var phrase = 'Please connect me to a live agent / human support engineer to review this issue.';
+        setClientMessage(cur ? (cur + "\n\n" + phrase) : phrase);
+        target.focus();
+    };
+
+    window.generateClientAIResponse = function(mode, lang) {
+        var currentMessage = getClientMessage();
+        var chosenLang = lang || $('#nekoClientLang').val() || 'auto';
+        var isPanelMode = (mode === 'summarize');
+        var originalContent = currentMessage;
+
+        showClientStatus(isPanelMode ? 'Summarizing ticket conversation...' : 'Generating response...');
+        if (!isPanelMode) {
+            setClientMessage('AI is preparing your message... Please wait.');
+        }
+
+        $.post('index.php?m=gemini_ai_assistant', {
+            token: getToken(),
             action: 'client_generate_ai_reply',
             tid_mask: tidMask,
             c: ticketC,
             reply_mode: mode,
-            reply_lang: lang || 'auto',
+            reply_lang: chosenLang,
             current_message: currentMessage
         }, function(response) {
-            btn.removeClass('disabled').removeAttr('disabled');
-            btnText.html(originalBtnHtml);
-
-            if (!mde) {
-                replyArea.removeAttr('disabled');
-            }
-
+            hideClientStatus();
             if (response && response.success) {
-                if (mde) {
-                    mde.setContent(response.response);
+                if (isPanelMode) {
+                    renderClientResultPanel('Ticket Conversation Summary', '<div>' + esc(response.response).replace(/\n/g, '<br>') + '</div>', '');
                 } else {
-                    replyArea.val(response.response);
+                    setClientMessage(response.response);
                 }
             } else {
-                if (mde) {
-                    mde.setContent(originalContent);
-                } else {
-                    replyArea.val(originalContent);
-                }
+                if (!isPanelMode) setClientMessage(originalContent);
                 alert('AI Error: ' + (response ? response.error : 'Unknown error'));
             }
         }, 'json').fail(function() {
-            btn.removeClass('disabled').removeAttr('disabled');
-            btnText.html(originalBtnHtml);
-            
-            if (!mde) replyArea.removeAttr('disabled');
-            
-            if (mde) {
-                mde.setContent(originalContent);
-            } else {
-                replyArea.val(originalContent);
-            }
+            hideClientStatus();
+            if (!isPanelMode) setClientMessage(originalContent);
             alert('Could not communicate with the AI. Please try again.');
         });
     };
 });
 </script>
 <style>
-/* Dropdown hover effects for client area compatibility */
-.client-ai-reply-container .dropdown-menu > li > a {
-    padding: 6px 20px;
-    clear: both;
-    font-weight: 400;
-    line-height: 1.42857143;
-    color: #333;
-    white-space: nowrap;
-    display: block;
+.neko-client-card {
+    margin: 12px 0 16px 0;
+    background: #ffffff;
+    border: 1px solid #dbe4ee;
+    border-radius: 10px;
+    box-shadow: 0 3px 14px rgba(15, 23, 42, 0.06);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: visible;
 }
-.client-ai-reply-container .dropdown-menu > li > a:hover {
-    background-color: #f5f5f5;
+.neko-client-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 15px;
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+    color: #ffffff;
+    border-radius: 9px 9px 0 0;
+}
+.neko-client-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.neko-client-title small {
+    display: block;
+    color: #cbd5e1;
+    font-size: 11px;
+}
+.neko-client-badge {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: rgba(56, 189, 248, 0.22);
+    color: #38bdf8;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+}
+.neko-client-head-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.neko-client-select {
+    background: rgba(255,255,255,0.12);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+.neko-client-select option {
+    color: #0f172a;
+    background: #fff;
+}
+.neko-client-templates {
+    padding: 8px 15px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+}
+.neko-tpl-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #64748b;
+    margin-right: 4px;
+}
+.neko-tpl-chip {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    color: #334155;
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+.neko-tpl-chip:hover {
+    background: #e0f2fe;
+    border-color: #38bdf8;
+    color: #0369a1;
+}
+.neko-client-actions {
+    padding: 10px 15px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    align-items: center;
+}
+.neko-cbtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 11px;
+    border-radius: 6px;
+    border: 1px solid #cbd5e1;
+    background: #f8fafc;
+    color: #1e293b;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+.neko-cbtn:hover { background: #e2e8f0; }
+.neko-cbtn-primary { background: #0284c7; border-color: #0369a1; color: #fff; }
+.neko-cbtn-primary:hover { background: #0369a1; }
+.neko-cbtn-diagnose { background: #059669; border-color: #047857; color: #fff; }
+.neko-cbtn-diagnose:hover { background: #047857; }
+.neko-cbtn-human { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.3); color: #fff; }
+.neko-cbtn-human:hover { background: rgba(255,255,255,0.25); }
+.neko-cmenu-wrap { position: relative; display: inline-block; }
+.neko-cmenu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 9999;
+    min-width: 185px;
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.14);
+    padding: 5px 0;
+    margin-top: 4px;
+}
+.neko-cmenu a {
+    display: block;
+    padding: 7px 14px;
+    font-size: 12px;
+    color: #1e293b;
     text-decoration: none;
-    color: #262626;
 }
-.client-ai-reply-container .dropdown-header {
-    display: block;
-    margin-top: 5px;
-    margin-bottom: 5px;
+.neko-cmenu a:hover {
+    background: #f1f5f9;
+    color: #0284c7;
+}
+.neko-client-status {
+    padding: 8px 15px;
+    background: #eff6ff;
+    border-top: 1px solid #dbeafe;
+    color: #1e40af;
+    font-size: 12px;
+}
+.neko-client-result {
+    border-top: 1px solid #cbd5e1;
+    background: #f8fafc;
+    border-radius: 0 0 9px 9px;
+}
+.neko-result-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 15px;
+    background: #e2e8f0;
+    color: #0f172a;
+    font-size: 12px;
+}
+.neko-result-body {
+    padding: 12px 15px;
+    font-size: 13px;
+    color: #1e293b;
+    line-height: 1.5;
+}
+.neko-diag-guidance {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+.neko-diag-list {
+    margin: 6px 0 8px 18px;
+    padding: 0;
+}
+.neko-kb-box {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: #f0f9ff;
+    border-left: 3px solid #0284c7;
+    border-radius: 4px;
 }
 </style>
 HTML;
-    }
+
+    return str_replace('__PAGE_MODE__', $page_mode, $html);
 });
 
 
@@ -1909,6 +2608,10 @@ function build_ai_prompt($message, $ticket_id, $analysis, $config, $mode = 'gene
             $task_description = "TASK: Create a draft Knowledge Base article based on the resolution provided in the ticket history below. Include a Title, Problem, and Solution section.";
             $content_to_process = "TICKET MESSAGES:\n{$message}";
             break;
+        case 'internal_handover':
+            $task_description = "TASK: Write a concise internal shift-handover note for another support engineer summarizing: (1) Issue, (2) What was checked/tried so far, (3) Current status & blockers, (4) Exact recommended next step.";
+            $content_to_process = "TICKET MESSAGES:\n{$message}";
+            break;
         case 'rewrite_fix_grammar':
             $task_description = "TASK: Fix the spelling and grammar in the following staff draft without significantly changing its tone or length.";
             $content_to_process = "STAFF DRAFT:\n{$current_draft}";
@@ -1975,8 +2678,16 @@ function build_ai_prompt($message, $ticket_id, $analysis, $config, $mode = 'gene
                 $content_to_process = "YOUR DRAFT:\n{$current_draft}";
                 break;
             case 'summarize':
-                $task_description = "TASK: Summarize your current problem based on the ticket history.";
+                $task_description = "TASK: Summarize your current problem and what support has asked/done so far based on the ticket history.";
                 $content_to_process = "TICKET MESSAGES:\n{$message}";
+                break;
+            case 'format_logs':
+                $task_description = "TASK: Format the raw error message/logs in your draft cleanly using Markdown code blocks, and add a 1-2 sentence plain-language summary of what you are seeing so the support team can diagnose it quickly.";
+                $content_to_process = "YOUR RAW ERROR / LOGS:\n{$current_draft}";
+                break;
+            case 'rewrite_fix_grammar':
+                $task_description = "TASK: Fix spelling and grammar in your draft while keeping the exact meaning.";
+                $content_to_process = "YOUR DRAFT:\n{$current_draft}";
                 break;
             case 'generate':
             default:

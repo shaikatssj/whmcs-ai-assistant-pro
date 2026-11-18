@@ -343,6 +343,102 @@ function gemini_ai_assistant_clientarea($vars)
 {
     if (isset($_POST['action'])) {
         $action = $_POST['action'];
+        $config = function_exists('get_gemini_config') ? get_gemini_config() : [];
+
+        // --- Pre-submit Ticket Assistant & Self-Service Troubleshooter (no ticket ID yet) ---
+        if ($action == 'client_submit_diagnose') {
+            $session_uid = (int) ($_SESSION['uid'] ?? 0);
+            $related_service = trim((string) ($_POST['related_service'] ?? ''));
+            $subject = trim((string) ($_POST['subject'] ?? ''));
+            $message = trim((string) ($_POST['message'] ?? ''));
+            $lang = $_POST['reply_lang'] ?? 'auto';
+
+            $diag = neko_client_safe_diagnostics($session_uid, $related_service, '', $subject . ' ' . $message);
+
+            $lang_rule = $lang === 'bangla'
+                ? 'Respond strictly in Bangla (বাংলা).'
+                : ($lang === 'english' ? 'Respond strictly in English.' : 'Respond in the same language as the customer text (default English).');
+
+            $ai_guidance = '';
+            if (!empty($config['gemini_api_key'])) {
+                $diag_prompt = "You are a friendly self-service hosting troubleshooter helping a customer BEFORE they submit a support ticket.\n" .
+                    "{$lang_rule}\n" .
+                    "CUSTOMER SUBJECT: {$subject}\n" .
+                    "CUSTOMER MESSAGE: {$message}\n" .
+                    "VERIFIED DIAGNOSTIC FINDINGS (JSON):\n" . json_encode($diag, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n\n" .
+                    "INSTRUCTIONS:\n" .
+                    "1. Explain clearly what the live check found (e.g., if a service is Suspended, an invoice is Unpaid, DNS A record doesn't match server IP, HTTP error, or SSL expired).\n" .
+                    "2. Give concrete self-service steps the customer can try right now if applicable.\n" .
+                    "3. Only cite facts present in the JSON above. Keep it concise (4-7 lines).";
+
+                $ai_res = call_gemini_api($diag_prompt, $config, 'client_submit_diag', null);
+                if (!empty($ai_res['success'])) {
+                    $ai_guidance = $ai_res['response'] ?? '';
+                }
+            }
+
+            $report_lines = [];
+            if (!empty($diag['target_domain'])) {
+                $report_lines[] = "Domain Checked: {$diag['target_domain']}";
+            }
+            foreach (($diag['findings'] ?? []) as $f) {
+                $report_lines[] = "- {$f['label']}: {$f['detail']}";
+            }
+            if (!empty($diag['http_ssl']['http_checks']['https']['http_code'])) {
+                $report_lines[] = "- Live HTTPS Status: " . $diag['http_ssl']['http_checks']['https']['http_code'];
+            }
+
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode([
+                'success' => true,
+                'target_domain' => $diag['target_domain'] ?? '',
+                'findings' => $diag['findings'] ?? [],
+                'kb_articles' => $diag['kb_articles'] ?? [],
+                'ai_guidance' => $ai_guidance,
+                'report_text' => implode("\n", $report_lines),
+            ]);
+            exit;
+        }
+
+        if ($action == 'client_submit_assist') {
+            if (empty($config['gemini_api_key'])) {
+                ob_clean();
+                header('Content-Type: application/json');
+                echo json_encode(['success' => false, 'error' => 'AI service is not configured yet.']);
+                exit;
+            }
+
+            $assist_mode = $_POST['assist_mode'] ?? 'polish_ticket';
+            $subject = trim((string) ($_POST['subject'] ?? ''));
+            $message = trim((string) ($_POST['message'] ?? ''));
+            $lang = $_POST['reply_lang'] ?? 'auto';
+
+            $lang_rule = $lang === 'bangla'
+                ? 'Write the output strictly in Bangla (বাংলা).'
+                : ($lang === 'english' ? 'Write the output strictly in English.' : 'Detect the language of the input and write in that same language.');
+
+            $task = 'Rewrite the customer ticket description below so it is clear, polite, concise, and easy for a support engineer to act on.';
+            if ($assist_mode === 'structure_bug_report') {
+                $task = 'Reorganize the customer notes below into a structured hosting support report with clear sections (Issue Summary, Affected Domain/Service, Exact Error/Behavior, Steps Already Tried). Do not invent facts the user did not provide.';
+            } elseif ($assist_mode === 'suggest_subject') {
+                $task = 'Generate a single concise, descriptive support ticket subject line (max 10 words, no quotes) summarizing the issue below.';
+            } elseif ($assist_mode === 'format_logs') {
+                $task = 'Format the raw error output/logs below inside clean Markdown code blocks with a 1-2 line plain summary above it.';
+            }
+
+            $prompt = "You are helping a web hosting customer write a support ticket.\n{$task}\n{$lang_rule}\n" .
+                "Subject: {$subject}\nDraft Message:\n{$message}\n" .
+                "Write from the customer's perspective ('I'/'my'). Output ONLY the text.";
+
+            $ai_res = call_gemini_api($prompt, $config, 'client_submit_assist', null);
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode($ai_res);
+            exit;
+        }
+
+        // --- Existing Ticket Actions (require valid tid_mask & ticket c hash) ---
         $tid_mask = $_POST['tid_mask'] ?? '';
         $c = $_POST['c'] ?? '';
 
@@ -362,6 +458,45 @@ function gemini_ai_assistant_clientarea($vars)
         }
 
         $ticket_id = $ticket->id;
+
+        if ($action == 'client_viewticket_diagnose') {
+            $lang = $_POST['reply_lang'] ?? 'auto';
+            $client_id = (int) ($ticket->userid ?? 0);
+            $rel = !empty($ticket->service) ? ('S' . (int) $ticket->service) : (!empty($ticket->domainid) ? ('D' . (int) $ticket->domainid) : '');
+            $diag = neko_client_safe_diagnostics($client_id, $rel, '', $ticket->title . ' ' . $ticket->message);
+
+            $ai_guidance = '';
+            if (!empty($config['gemini_api_key'])) {
+                $lang_rule = $lang === 'bangla' ? 'Respond in Bangla (বাংলা).' : ($lang === 'english' ? 'Respond in English.' : 'Respond in the same language as the ticket.');
+                $diag_prompt = "Summarize these live account/DNS/SSL diagnostic results in 4-6 friendly, actionable bullet points for the customer.\n{$lang_rule}\n" .
+                    json_encode($diag, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                $ai_res = call_gemini_api($diag_prompt, $config, 'client_view_diag', $ticket_id);
+                if (!empty($ai_res['success'])) {
+                    $ai_guidance = $ai_res['response'] ?? '';
+                }
+            }
+
+            $report_lines = [];
+            if (!empty($diag['target_domain'])) {
+                $report_lines[] = "Diagnostic Check for {$diag['target_domain']}:";
+            }
+            foreach (($diag['findings'] ?? []) as $f) {
+                $report_lines[] = "- {$f['label']}: {$f['detail']}";
+            }
+            if (!empty($diag['http_ssl']['http_checks']['https']['http_code'])) {
+                $report_lines[] = "- HTTPS Status: " . $diag['http_ssl']['http_checks']['https']['http_code'];
+            }
+
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode([
+                'success' => true,
+                'findings' => $diag['findings'] ?? [],
+                'ai_guidance' => $ai_guidance,
+                'report_text' => implode("\n", $report_lines),
+            ]);
+            exit;
+        }
 
         if ($action == 'client_generate_ai_reply') {
             $mode = $_POST['reply_mode'] ?? 'generate';
@@ -480,6 +615,37 @@ function handle_admin_actions($vars)
                 ->update(['needs_human' => 0]);
         }
         redirect_with_message('Escalation marked as resolved.');
+    } elseif ($_POST['action'] == 'admin_diag_bench') {
+        $ticket_ref = trim((string) ($_POST['bench_ticket'] ?? ''));
+        $domain_ref = trim((string) ($_POST['bench_domain'] ?? ''));
+        $out = [];
+
+        if ($ticket_ref !== '') {
+            $ticket = Capsule::table('tbltickets')
+                ->where('id', (int) $ticket_ref)
+                ->orWhere('tid', $ticket_ref)
+                ->first();
+            if ($ticket) {
+                $config = get_gemini_config();
+                $latest = Capsule::table('tblticketreplies')
+                    ->where('tid', $ticket->id)
+                    ->where('admin', '')
+                    ->orderBy('id', 'desc')
+                    ->value('message') ?: $ticket->message;
+                $out['ticket_dry_run'] = neko_run_whmcs_agent($ticket->id, (string) $latest, $config, ['mode' => 'admin_assist']);
+                $out['ticket_tid'] = $ticket->tid;
+            } else {
+                $out['error'] = "Ticket '{$ticket_ref}' not found.";
+            }
+        }
+
+        if ($domain_ref !== '') {
+            $out['dns'] = neko_tool_check_domain_dns($domain_ref, 0);
+            $out['http_ssl'] = neko_tool_check_website_http_ssl($domain_ref);
+        }
+
+        $_SESSION['neko_bench_result'] = $out;
+        redirect_with_message('Diagnostic Bench run completed. Open the Agent Bench tab to view results.');
     }
 }
 
@@ -719,10 +885,18 @@ function display_admin_interface($vars)
                                 </div>
                             </form>
 
-                            <a href="#api-logs" class="btn btn-action btn-primary">
+                            <button type="button" class="btn btn-action btn-primary" onclick="nekoOpenTab('api')">
                                 <i class="fas fa-terminal"></i>
                                 <span>View API Logs</span>
-                            </a>
+                            </button>
+                            <button type="button" class="btn btn-action btn-success" onclick="nekoOpenTab('agent-actions')">
+                                <i class="fas fa-tools"></i>
+                                <span>Agent Actions</span>
+                            </button>
+                            <button type="button" class="btn btn-action btn-default" onclick="nekoOpenTab('agent-bench')">
+                                <i class="fas fa-flask"></i>
+                                <span>Agent Diagnostic Bench</span>
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -775,6 +949,11 @@ function display_admin_interface($vars)
                         <li role="presentation">
                             <a href="#agent-actions" aria-controls="agent-actions" role="tab" data-toggle="tab">
                                 <i class="fas fa-tools"></i> Agent Actions
+                            </a>
+                        </li>
+                        <li role="presentation">
+                            <a href="#agent-bench" aria-controls="agent-bench" role="tab" data-toggle="tab">
+                                <i class="fas fa-flask"></i> Agent Bench
                             </a>
                         </li>
                     </ul>
@@ -1366,6 +1545,46 @@ function display_admin_interface($vars)
                             </div>
                         </div>
 
+                        <!-- Agent Diagnostic Bench Tab -->
+                        <div role="tabpanel" class="tab-pane" id="agent-bench">
+                            <div class="neko-card">
+                                <div class="card-header">
+                                    <h4><i class="fas fa-flask"></i> Agent Diagnostic Bench (Safe Read-Only Dry-Run)</h4>
+                                </div>
+                                <div class="card-body">
+                                    <p style="color: var(--gray); margin-bottom: 15px;">
+                                        Test Neko AI Agent safely without sending any customer reply or executing write actions. Enter a Ticket ID/TID, a Domain, or both.
+                                    </p>
+                                    <form method="post" class="row">
+                                        <input type="hidden" name="action" value="admin_diag_bench">
+                                        <div class="col-md-4 form-group">
+                                            <label>Ticket ID or TID (optional)</label>
+                                            <input type="text" name="bench_ticket" class="form-control" placeholder="e.g. 123 or ABC-123456">
+                                        </div>
+                                        <div class="col-md-5 form-group">
+                                            <label>Domain DNS &amp; SSL Probe (optional)</label>
+                                            <input type="text" name="bench_domain" class="form-control" placeholder="e.g. example.com">
+                                        </div>
+                                        <div class="col-md-3 form-group" style="padding-top: 25px;">
+                                            <button type="submit" class="btn btn-primary btn-block">
+                                                <i class="fas fa-play"></i> Run Dry-Run
+                                            </button>
+                                        </div>
+                                    </form>
+                                    <?php
+                                    if (!empty($_SESSION['neko_bench_result'])) {
+                                        $bench = $_SESSION['neko_bench_result'];
+                                        unset($_SESSION['neko_bench_result']);
+                                        echo '<div style="margin-top: 15px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 14px;">';
+                                        echo '<h5 style="margin-top:0;">Last Dry-Run Output</h5>';
+                                        echo '<pre style="max-height: 360px; overflow-y: auto; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px;">' . htmlspecialchars(json_encode($bench, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) . '</pre>';
+                                        echo '</div>';
+                                    }
+                                    ?>
+                                </div>
+                            </div>
+                        </div>
+
                     </div>
                 </div>
             </div>
@@ -1445,44 +1664,37 @@ function display_admin_interface($vars)
             --spacing-xl: 2rem;
         }
 
-        body {
-            font-family: var(--font-family-sans);
-            font-size: var(--font-size-base);
-            line-height: var(--line-height-base);
-            color: var(--dark);
-            background-color: var(--lighter);
-            margin: 0;
-            padding: 0;
-        }
-
         .neko-logo {
-            width: 50px;
-            /* adjust size here */
+            width: 48px;
             height: auto;
             border-radius: 10px;
-            /* optional rounded look */
             object-fit: contain;
         }
 
         .neko-ai-container {
             font-family: var(--font-family-sans);
+            font-size: var(--font-size-base);
+            line-height: var(--line-height-base);
+            color: var(--dark);
             padding: var(--spacing-md);
-            max-width: 1200px;
+            max-width: 1360px;
             margin: 0 auto;
         }
 
         /* Header Styles */
         .neko-header {
-            background: var(--white);
+            background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 100%);
             color: var(--primary);
             padding: var(--spacing-lg);
-            border-radius: var(--radius-lg);
+            border-radius: 10px;
             margin-bottom: var(--spacing-xl);
             display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
             justify-content: space-between;
-            align-items: flex-start;
+            align-items: center;
             box-shadow: var(--shadow);
-            border: 1px solid var(--border);
+            border: 1px solid #dbeafe;
         }
 
         .header-content h1 {
@@ -2513,6 +2725,18 @@ function display_admin_interface($vars)
                 }
             });
         });
+
+        function nekoOpenTab(tabId) {
+            var tabLink = document.querySelector('.neko-tabs .nav-tabs a[href="#' + tabId + '"]');
+            if (tabLink) {
+                if (typeof jQuery !== 'undefined' && typeof jQuery(tabLink).tab === 'function') {
+                    jQuery(tabLink).tab('show');
+                } else {
+                    tabLink.click();
+                }
+                tabLink.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+        }
 
         function viewLogDetails(logId) {
             fetch('addonmodules.php?module=gemini_ai_assistant', {
