@@ -5,208 +5,294 @@ if (!defined("WHMCS")) {
 
 use WHMCS\Database\Capsule;
 
-// Hook for ticket creation and replies
-add_hook('TicketOpen', 1, function ($vars) {
-    $config = get_gemini_config();
+require_once __DIR__ . '/includes/agent_tools.php';
+require_once __DIR__ . '/includes/agent_runner.php';
 
-    if (!$config['auto_reply_enabled']) {
+/**
+ * Shared entrypoint for TicketOpen and TicketUserReply autopilot handling.
+ */
+function neko_handle_incoming_ticket_event($ticket_id, $latest_message, $is_new_ticket = false)
+{
+    $config = get_gemini_config();
+    if (empty($config['auto_reply_enabled'])) {
         return;
     }
-    $ticket_id = $vars['ticketid'];
 
     $ticket_data = Capsule::table('tbltickets')->where('id', $ticket_id)->first();
-    if (!$ticket_data) return;
+    if (!$ticket_data || strcasecmp((string) $ticket_data->status, 'Closed') === 0) {
+        return;
+    }
 
-    // Try to get the latest message from replies
+    $message = trim((string) $latest_message);
+    if ($message === '') {
+        $message = (string) ($ticket_data->message ?? '');
+    }
+
+    // Check Autopilot Departments first (blank = all departments)
+    $autopilot_departments = array_filter(array_map('trim', explode(',', (string) ($config['autopilot_departments'] ?? ''))));
+    if (!empty($autopilot_departments) && !in_array((string) $ticket_data->did, $autopilot_departments, true)) {
+        logActivity("Neko AI: Skipping auto-reply for ticket #$ticket_id - department #{$ticket_data->did} not in autopilot list");
+        return;
+    }
+
+    // 1. Check if user explicitly asked for a human agent (bypass cooldown)
+    if (should_skip_ai_reply($message)) {
+        mark_ticket_for_human($ticket_id);
+        logActivity("Neko AI: Escalated ticket #$ticket_id - customer requested human agent");
+        return;
+    }
+
+    // 2. If ticket was already escalated to human, do NOT let AI jump back in unless an admin cleared needs_human
+    $existing_analysis = Capsule::table('mod_gemini_ticket_analysis')->where('ticket_id', $ticket_id)->first();
+    if ($existing_analysis && !empty($existing_analysis->needs_human)) {
+        logActivity("Neko AI: Skipping auto-reply for ticket #$ticket_id - already flagged for human support");
+        return;
+    }
+
+    // 3. Cooldown check: avoid double-replying within 2 minutes
+    $recent_reply = Capsule::table('mod_gemini_ai_logs')
+        ->where('ticket_id', $ticket_id)
+        ->whereIn('response_type', ['generate', 'agent_solve'])
+        ->where('created_at', '>', date('Y-m-d H:i:s', strtotime('-2 minutes')))
+        ->first();
+
+    if ($recent_reply) {
+        logActivity("Neko AI: Skipping auto-reply for ticket #$ticket_id - cooldown active");
+        return;
+    }
+
+    // 4. Analyze ticket mood & escalation heuristics BEFORE calling AI
+    $analysis = analyze_ticket_content($message, $ticket_id);
+    if ($analysis['escalation_level'] > 0.8) {
+        mark_ticket_for_human($ticket_id);
+        logActivity("Neko AI: Ticket #$ticket_id escalated due to high mood escalation ({$analysis['mood']})");
+        return;
+    }
+
+    // 5. Autopilot Delay Queue
+    $delay = (int) ($config['autopilot_delay'] ?? 0);
+    if ($delay > 0) {
+        Capsule::table('mod_gemini_reply_queue')->where('ticket_id', $ticket_id)->where('status', 'pending')->delete();
+        Capsule::table('mod_gemini_reply_queue')->insert([
+            'ticket_id' => $ticket_id,
+            'user_message' => $message,
+            'status' => 'pending',
+            'scheduled_at' => date('Y-m-d H:i:s', strtotime("+{$delay} minutes")),
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+        logActivity("Neko AI: Queued autopilot reply for ticket #$ticket_id (Delay: {$delay} mins)");
+        return;
+    }
+
+    // 6. Execute autonomous agent or legacy reply
+    neko_execute_autopilot_solve($ticket_id, $message, $analysis, $config);
+}
+
+/**
+ * Run the agent (or legacy generator) and enforce uncertain-behavior safety policies.
+ */
+function neko_execute_autopilot_solve($ticket_id, $message, array $analysis, array $config)
+{
+    $ticket = Capsule::table('tbltickets')->where('id', $ticket_id)->first();
+    if (!$ticket) {
+        return false;
+    }
+
+    $agent_enabled = !empty($config['agent_enabled']);
+    if ($agent_enabled) {
+        $result = neko_run_whmcs_agent($ticket_id, $message, $config, ['mode' => 'autopilot']);
+        $response_type = 'agent_solve';
+    } else {
+        if ($analysis['confidence'] < $config['confidence_threshold']) {
+            logActivity("Neko AI: Low pre-check confidence ({$analysis['confidence']}) for ticket #$ticket_id - skipping auto-reply");
+            return false;
+        }
+        $result = generate_ai_ticket_response($message, $ticket_id, $analysis);
+        $response_type = 'generate';
+    }
+
+    if (!$result || empty($result['success'])) {
+        logActivity("Neko AI: Failed to generate response for ticket #$ticket_id - " . ($result['error'] ?? 'Unknown error'));
+        return false;
+    }
+
+    $ai_confidence = (float) ($result['confidence'] ?? $analysis['confidence'] ?? 0.5);
+    $ai_mood = $result['mood'] ?? $analysis['mood'] ?? 'neutral';
+    $ai_escalation = (float) ($result['escalation_level'] ?? $analysis['escalation_level'] ?? 0.3);
+    $needs_human = !empty($result['needs_human']) || ($result['can_resolve'] ?? true) === false || $ai_escalation > 0.8;
+
+    // Persist updated analysis from the agent
+    Capsule::table('mod_gemini_ticket_analysis')->updateOrInsert(
+        ['ticket_id' => $ticket_id],
+        [
+            'mood' => $ai_mood,
+            'escalation_level' => $ai_escalation,
+            'key_issues' => extract_key_issues($message),
+            'needs_human' => $needs_human ? 1 : 0,
+            'analyzed_at' => date('Y-m-d H:i:s'),
+        ]
+    );
+
+    // Log interaction
+    Capsule::table('mod_gemini_ai_logs')->insert([
+        'ticket_id' => $ticket_id,
+        'user_message' => substr($message, 0, 2000),
+        'ai_response' => $result['response'] ?? '',
+        'confidence_score' => $ai_confidence,
+        'mood_detected' => $ai_mood,
+        'response_type' => $response_type,
+        'created_at' => date('Y-m-d H:i:s'),
+    ]);
+
+    $threshold = (float) ($config['confidence_threshold'] ?? 0.7);
+    $uncertain_policy = $config['agent_uncertain_behavior'] ?? 'draft_note';
+
+    // CRITICAL: Never send an uncertain or human-needed reply to an annoyed/waiting customer
+    if ($needs_human || $ai_confidence < $threshold) {
+        $reason = !empty($result['escalation_reason'])
+            ? $result['escalation_reason']
+            : ($needs_human ? 'Agent determined human intervention is required' : "Confidence ({$ai_confidence}) below threshold ({$threshold})");
+
+        $trace_lines = [];
+        foreach (($result['tools_trace'] ?? []) as $tr) {
+            $trace_lines[] = "- {$tr['tool']}: {$tr['summary']}";
+        }
+        $trace_block = !empty($trace_lines) ? "\nTools Executed:\n" . implode("\n", $trace_lines) : '';
+        $internal_note = !empty($result['internal_note']) ? "\nAgent Findings:\n{$result['internal_note']}" : '';
+        $draft_block = !empty($result['response']) ? "\nSuggested Draft Reply (NOT sent to client):\n{$result['response']}" : '';
+
+        neko_local_api('AddTicketNote', [
+            'ticketid' => $ticket_id,
+            'message' => "[Neko AI Agent - Human Review Required]\nReason: {$reason}\nMood: {$ai_mood} | Confidence: " . round($ai_confidence * 100) . "%{$internal_note}{$trace_block}{$draft_block}",
+        ]);
+
+        if ($uncertain_policy === 'escalate_notify') {
+            if (empty($result['escalated_via_tool'])) {
+                escalate_to_admin($ticket_id, (int) ($ticket->userid ?? 0), $reason);
+            }
+            notify_client_escalation($ticket_id, $config);
+        } elseif ($uncertain_policy === 'escalate_silent') {
+            if (empty($result['escalated_via_tool'])) {
+                escalate_to_admin($ticket_id, (int) ($ticket->userid ?? 0), $reason);
+            }
+        }
+        // 'draft_note': saved private admin note without bothering customer with a robotic reply
+
+        logActivity("Neko AI: Held public reply for ticket #$ticket_id (policy={$uncertain_policy}, conf={$ai_confidence}, reason={$reason})");
+        return false;
+    }
+
+    // Verified & confident -> send reply to customer and log internal findings note if tools ran
+    $analysis['mood'] = $ai_mood;
+    $analysis['confidence'] = $ai_confidence;
+    add_ticket_reply($ticket_id, $result, $analysis);
+
+    if (!empty($result['internal_note'])) {
+        neko_local_api('AddTicketNote', [
+            'ticketid' => $ticket_id,
+            'message' => "[Neko AI Agent Resolution Note]\n{$result['internal_note']}",
+        ]);
+    }
+
+    logActivity("Neko AI: Auto-solved & replied to ticket #$ticket_id (confidence: {$ai_confidence})");
+    return true;
+}
+
+// Hook for ticket creation
+add_hook('TicketOpen', 1, function ($vars) {
+    $ticket_id = (int) ($vars['ticketid'] ?? 0);
+    if ($ticket_id <= 0) {
+        return;
+    }
+
     $message = Capsule::table('tblticketreplies')
         ->where('tid', $ticket_id)
         ->orderBy('id', 'desc')
         ->value('message');
 
-    // If no replies exist yet, use the original ticket message
     if (empty($message)) {
-        $message = Capsule::table('tbltickets')
-            ->where('id', $ticket_id)
-            ->value('message');
+        $message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
     }
 
-    // Check if user requested to talk to agent FIRST (bypass cooldown)
-    if (should_skip_ai_reply($message)) {
-        mark_ticket_for_human($ticket_id);
-        logActivity("AI Assistant: Skipped auto-reply for ticket #$ticket_id - user requested human agent");
-        return;
-    }
-
-    // 🛑 Cooldown check: Don't auto-reply if we sent one in the last 2 minutes for this ticket
-    $recent_reply = Capsule::table('mod_gemini_ai_logs')
-        ->where('ticket_id', $ticket_id)
-        ->where('response_type', 'generate')
-        ->where('created_at', '>', date('Y-m-d H:i:s', strtotime('-2 minutes')))
-        ->first();
-
-    if ($recent_reply) {
-        logActivity("Gemini AI: Skipping auto-reply for ticket #$ticket_id - cooldown active");
-        return;
-    }
-
-    // Log for debugging
-    logActivity("Gemini AI: fetched message for ticket #$ticket_id (" . strlen($message) . " chars)");
-
-    // Analyze ticket mood and content
-    $analysis = analyze_ticket_content($message, $ticket_id);
-
-    // Check confidence threshold
-    if ($analysis['confidence'] < $config['confidence_threshold']) {
-        logActivity("AI Assistant: Low confidence ({$analysis['confidence']}) for ticket #$ticket_id - skipping auto-reply");
-        return;
-    }
-
-    // Check Autopilot Departments
-    $autopilot_departments = array_filter(array_map('trim', explode(',', $config['autopilot_departments'] ?? '')));
-    if (!empty($autopilot_departments) && !in_array($ticket_data->did, $autopilot_departments)) {
-        logActivity("Gemini AI: Skipping auto-reply for ticket #$ticket_id - department not enabled for autopilot");
-        return;
-    }
-
-    // Autopilot Delay Check
-    $delay = (int) ($config['autopilot_delay'] ?? 0);
-    if ($delay > 0) {
-        // Remove any existing pending queue for this ticket to avoid duplicates
-        Capsule::table('mod_gemini_reply_queue')->where('ticket_id', $ticket_id)->where('status', 'pending')->delete();
-        
-        Capsule::table('mod_gemini_reply_queue')->insert([
-            'ticket_id' => $ticket_id,
-            'user_message' => $message,
-            'status' => 'pending',
-            'scheduled_at' => date('Y-m-d H:i:s', strtotime("+$delay minutes")),
-            'created_at' => date('Y-m-d H:i:s'),
-        ]);
-        logActivity("Gemini AI: Queued autopilot reply for ticket #$ticket_id (Delay: $delay mins)");
-        return;
-    }
-
-    // Generate AI response immediately
-    $ai_response = generate_ai_ticket_response($message, $ticket_id, $analysis);
-
-    if ($ai_response && $ai_response['success']) {
-        // Add the AI response to the ticket
-        add_ticket_reply($ticket_id, $ai_response, $analysis);
-
-
-        logActivity("AI Assistant: Auto-reply sent for ticket #$ticket_id with confidence: {$ai_response['confidence']}");
-    } else {
-        logActivity("AI Assistant: Failed to generate response for ticket #$ticket_id - " . ($ai_response['error'] ?? 'Unknown error'));
-    }
+    neko_handle_incoming_ticket_event($ticket_id, $message, true);
 });
 
 // Hook for ticket replies from users
 add_hook('TicketUserReply', 1, function ($vars) {
-    $config = get_gemini_config();
-
-    if (!$config['auto_reply_enabled']) {
+    $ticket_id = (int) ($vars['ticketid'] ?? 0);
+    if ($ticket_id <= 0) {
         return;
     }
 
-    $ticket_id = $vars['ticketid'];
-
-    $ticket_data = Capsule::table('tbltickets')->where('id', $ticket_id)->first();
-    if (!$ticket_data) return;
-
-    $message = $vars['message'];
-
-    // Check if user requested to talk to agent FIRST (bypass cooldown)
-    if (should_skip_ai_reply($message)) {
-        mark_ticket_for_human($ticket_id);
-        logActivity("AI Assistant: User requested human agent for ticket #$ticket_id");
-        return;
-    }
-
-    // 🛑 Cooldown check: Don't auto-reply if we sent one in the last 2 minutes for this ticket
-    $recent_reply = Capsule::table('mod_gemini_ai_logs')
-        ->where('ticket_id', $ticket_id)
-        ->where('response_type', 'generate')
-        ->where('created_at', '>', date('Y-m-d H:i:s', strtotime('-2 minutes')))
-        ->first();
-
-    if ($recent_reply) {
-        logActivity("Gemini AI: Skipping auto-reply for ticket #$ticket_id - cooldown active");
-        return;
-    }
-
-    // Analyze the reply
-    $analysis = analyze_ticket_content($message, $ticket_id);
-
-    // Check if escalation is needed
-    if ($analysis['escalation_level'] > 0.8) {
-        mark_ticket_for_human($ticket_id);
-        logActivity("AI Assistant: Ticket #$ticket_id escalated due to high mood escalation");
-        return;
-    }
-
-    // Check Autopilot Departments
-    $autopilot_departments = array_filter(array_map('trim', explode(',', $config['autopilot_departments'] ?? '')));
-    if (!empty($autopilot_departments) && !in_array($ticket_data->did, $autopilot_departments)) {
-        return;
-    }
-
-    // Generate response if confidence is high enough
-    if ($analysis['confidence'] >= $config['confidence_threshold']) {
-        
-        // Autopilot Delay Check
-        $delay = (int) ($config['autopilot_delay'] ?? 0);
-        if ($delay > 0) {
-            Capsule::table('mod_gemini_reply_queue')->where('ticket_id', $ticket_id)->where('status', 'pending')->delete();
-            Capsule::table('mod_gemini_reply_queue')->insert([
-                'ticket_id' => $ticket_id,
-                'user_message' => $message,
-                'status' => 'pending',
-                'scheduled_at' => date('Y-m-d H:i:s', strtotime("+$delay minutes")),
-                'created_at' => date('Y-m-d H:i:s'),
-            ]);
-            logActivity("Gemini AI: Queued autopilot reply for ticket #$ticket_id (Delay: $delay mins)");
-            return;
-        }
-
-        $ai_response = generate_ai_ticket_response($message, $ticket_id, $analysis);
-
-        if ($ai_response && $ai_response['success']) {
-            add_ticket_reply($ticket_id, $ai_response, $analysis);
-            logActivity("AI Assistant: Auto-reply sent for ticket #$ticket_id with confidence: " . ($ai_response['confidence'] ?? $analysis['confidence']));
-        } else {
-            logActivity("AI Assistant: Failed to generate response for ticket #$ticket_id - " . ($ai_response['error'] ?? 'Unknown error'));
-        }
-    } else {
-        logActivity("AI Assistant: Low confidence ({$analysis['confidence']}) for ticket #$ticket_id - skipping auto-reply");
-    }
+    $message = $vars['message'] ?? '';
+    neko_handle_incoming_ticket_event($ticket_id, $message, false);
 });
 
-// Hook to add AI reply button in admin area
+// Hook to add AI reply AJAX handler in admin area
 add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
-    // 1. Handle AJAX requests for AI actions
     if ($vars['filename'] == 'supporttickets' && isset($_POST['action'])) {
         $action = $_POST['action'];
-        $ticket_id = (int) $_POST['ticket_id'];
+        $ticket_id = (int) ($_POST['ticket_id'] ?? 0);
 
         if ($action == 'generate_ai_reply') {
             $mode = $_POST['reply_mode'] ?? 'generate';
             $lang = $_POST['reply_lang'] ?? 'auto';
             $current_message = $_POST['current_message'] ?? '';
+            $custom_prompt = $_POST['custom_prompt'] ?? '';
+            $config = get_gemini_config();
 
-            // Get ticket message(s) for context
-            $message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
+            // Fetch latest customer message (or fallback to initial ticket message) instead of ignoring replies
+            $latest_message = Capsule::table('tblticketreplies')
+                ->where('tid', $ticket_id)
+                ->where('admin', '')
+                ->orderBy('id', 'desc')
+                ->value('message');
+            if (empty($latest_message)) {
+                $latest_message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
+            }
 
-            $analysis = analyze_ticket_content($message, $ticket_id);
-            $ai_response = generate_ai_ticket_response($message, $ticket_id, $analysis, $mode, $current_message, $lang);
+            $agent_modes = ['generate', 'agent_solve', 'triage'];
+            if (!empty($config['agent_enabled']) && in_array($mode, $agent_modes, true)) {
+                $runner_mode = ($mode === 'agent_solve') ? 'admin_solve' : (($mode === 'triage') ? 'triage' : 'admin_assist');
+                $ai_response = neko_run_whmcs_agent($ticket_id, (string) $latest_message, $config, [
+                    'mode' => $runner_mode,
+                    'lang' => $lang,
+                    'custom_prompt' => $custom_prompt,
+                ]);
+                if (!empty($ai_response['success'])) {
+                    Capsule::table('mod_gemini_ai_logs')->insert([
+                        'ticket_id' => $ticket_id,
+                        'user_message' => substr((string) $latest_message, 0, 2000),
+                        'ai_response' => $ai_response['response'] ?? '',
+                        'confidence_score' => (float) ($ai_response['confidence'] ?? 0.5),
+                        'mood_detected' => $ai_response['mood'] ?? 'neutral',
+                        'response_type' => $mode,
+                        'created_at' => date('Y-m-d H:i:s'),
+                    ]);
+                }
+            } else {
+                $analysis = analyze_ticket_content((string) $latest_message, $ticket_id);
+                $ai_response = generate_ai_ticket_response((string) $latest_message, $ticket_id, $analysis, $mode, $current_message, $lang);
+            }
 
+            ob_clean();
             header('Content-Type: application/json');
             echo json_encode($ai_response);
             exit;
         }
 
         if ($action == 'analyze_ticket_mood') {
-            $message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
-            $analysis = analyze_ticket_content($message, $ticket_id);
+            $latest_message = Capsule::table('tblticketreplies')
+                ->where('tid', $ticket_id)
+                ->where('admin', '')
+                ->orderBy('id', 'desc')
+                ->value('message');
+            if (empty($latest_message)) {
+                $latest_message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
+            }
+            $analysis = analyze_ticket_content((string) $latest_message, $ticket_id);
 
+            ob_clean();
             header('Content-Type: application/json');
             echo json_encode(array_merge(['success' => true], $analysis));
             exit;
@@ -251,7 +337,8 @@ $(document).ready(function() {
                     <i class="fas fa-robot"></i> <span class="btn-text">🤖 AI Reply</span> <span class="caret"></span>
                 </button>
                 <ul class="dropdown-menu multi-level" role="menu" aria-labelledby="dropdownMenu">
-                    <li><a href="javascript:void(0)" onclick="generateAIResponse('generate')"><i class="fas fa-magic"></i> Generate Reply</a></li>
+                    <li><a href="javascript:void(0)" onclick="generateAIResponse('generate')"><i class="fas fa-stethoscope"></i> Diagnose & Draft Reply (Read-Only)</a></li>
+                    <li><a href="javascript:void(0)" onclick="if(confirm('Allow Neko AI Agent to execute safe/configured WHMCS actions (if needed) and draft the reply?')) generateAIResponse('agent_solve')"><i class="fas fa-bolt"></i> Solve Issue & Draft Reply (Execute Actions)</a></li>
                     
                     <li class="dropdown-divider"></li>
                     <li class="dropdown-submenu">
@@ -299,6 +386,7 @@ $(document).ready(function() {
                 <span id="currentMood" class="label label-default" style="font-size: 11px; padding: 5px 10px;">Mood: Analyzing...</span>
                 <span id="confidenceBadge" class="label" style="font-size: 11px; padding: 5px 10px; margin-left: 5px;">Confidence: ...</span>
             </div>
+            <div id="nekoAgentTrace" style="display: none; margin-top: 10px; padding: 10px 12px; background: #f4f8fb; border-left: 4px solid #31a7c5; border-radius: 4px; font-size: 12px;"></div>
         </div>
     `;
     
@@ -308,6 +396,12 @@ $(document).ready(function() {
     // Analyze current ticket mood
     analyzeCurrentTicketMood({$ticket_id});
 });
+
+function nekoEscapeHtml(str) {
+    return String(str || '').replace(/[&<>"']/g, function(m) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+    });
+}
 
 function generateAIResponse(mode, lang) {
     var ticketId = {$ticket_id};
@@ -335,12 +429,13 @@ function generateAIResponse(mode, lang) {
     var originalBtnHtml = btnText.html();
     
     btn.addClass('disabled').attr('disabled', 'disabled');
-    btnText.html('<i class="fas fa-spinner fa-spin"></i> Processing...');
+    btnText.html('<i class="fas fa-spinner fa-spin"></i> Agent Investigating...');
+    $('#nekoAgentTrace').hide().empty();
 
     if (mde) {
-        mde.setContent('AI is processing your request... Please wait.');
+        mde.setContent('Neko AI Agent is checking WHMCS data & diagnosing... Please wait.');
     } else {
-        replyArea.val('AI is processing your request... Please wait.');
+        replyArea.val('Neko AI Agent is checking WHMCS data & diagnosing... Please wait.');
         replyArea.attr('disabled', 'disabled');
     }
     
@@ -355,9 +450,7 @@ function generateAIResponse(mode, lang) {
         btn.removeClass('disabled').removeAttr('disabled');
         btnText.html(originalBtnHtml);
 
-        if (mde) {
-            // No need to removeAttr disabled for MDE
-        } else {
+        if (!mde) {
             replyArea.removeAttr('disabled');
         }
 
@@ -368,8 +461,31 @@ function generateAIResponse(mode, lang) {
                 replyArea.val(response.response);
             }
 
-            if (response.mood && response.confidence) {
-                updateMoodDisplay(response.mood, response.confidence);
+            if (response.mood && response.confidence !== undefined) {
+                updateMoodDisplay(response.mood, response.confidence, response.escalation_level || 0);
+            }
+
+            // Render Agent Diagnostics & Tool Trace if present
+            if ((response.tools_trace && response.tools_trace.length > 0) || response.internal_note || response.needs_human) {
+                var html = '<strong><i class="fas fa-microscope"></i> Neko Agent Diagnostics:</strong>';
+                if (response.needs_human) {
+                    html += ' <span class="label label-danger">Human Intervention Recommended</span>';
+                    if (response.escalation_reason) {
+                        html += ' <span style="color:#c0392b;">(' + nekoEscapeHtml(response.escalation_reason) + ')</span>';
+                    }
+                }
+                if (response.internal_note) {
+                    html += '<div style="margin-top:5px; color:#2c3e50;">' + nekoEscapeHtml(response.internal_note) + '</div>';
+                }
+                if (response.tools_trace && response.tools_trace.length > 0) {
+                    html += '<ul style="margin:6px 0 0 18px; padding:0;">';
+                    response.tools_trace.forEach(function(tr) {
+                        var icon = tr.ok ? '<span style="color:#27ae60;">&#10004;</span>' : '<span style="color:#e74c3c;">&#10008;</span>';
+                        html += '<li>' + icon + ' <code>' + nekoEscapeHtml(tr.tool) + '</code> &rarr; ' + nekoEscapeHtml(tr.summary) + '</li>';
+                    });
+                    html += '</ul>';
+                }
+                $('#nekoAgentTrace').html(html).show();
             }
         } else {
             if (mde) {
@@ -712,31 +828,53 @@ function get_gemini_config()
         ->pluck('value', 'setting')
         ->toArray(); // Ensure associative array
 
+    $isOn = function ($key, $default = false) use ($settings) {
+        if (!array_key_exists($key, $settings)) {
+            return $default;
+        }
+        $val = strtolower(trim((string) $settings[$key]));
+        return in_array($val, ['1', 'on', 'yes', 'true'], true);
+    };
+
     return [
         // Core API Settings
         'gemini_api_key' => $settings['gemini_api_key'] ?? '',
-        'gemini_model' => $settings['gemini_model'] ?? 'gemini-1.5-flash',
-        'assistant_name' => $settings['assistant_name'] ?? 'AI Support',
-        'auto_reply_enabled' => !empty($settings['auto_reply_enabled']),
+        'gemini_model' => !empty($settings['gemini_model']) ? trim($settings['gemini_model']) : 'gemini-2.5-flash',
+        'assistant_name' => !empty($settings['assistant_name']) ? $settings['assistant_name'] : 'AI Support',
+        'auto_reply_enabled' => $isOn('auto_reply_enabled', true),
         'confidence_threshold' => (float) ($settings['confidence_threshold'] ?? 0.7),
-        'max_tokens' => (int) ($settings['max_tokens'] ?? 500),
-        'temperature' => (float) ($settings['temperature'] ?? 0.7),
+        'max_tokens' => (int) ($settings['max_tokens'] ?? 2048),
+        'temperature' => (float) ($settings['temperature'] ?? 0.4),
         'custom_instructions' => $settings['custom_instructions'] ?? '',
         'training_tickets_limit' => (int) ($settings['training_tickets_limit'] ?? 1000),
-        'enable_debug_logging' => !empty($settings['enable_debug_logging']),
+        'enable_debug_logging' => $isOn('enable_debug_logging', true),
 
         // Footer Controls
-        'ai_footer_enabled' => !empty($settings['ai_footer_enabled']) && $settings['ai_footer_enabled'] === 'on',
+        'ai_footer_enabled' => $isOn('ai_footer_enabled', true),
         'ai_footer_text' => $settings['ai_footer_text'] ?? "---\n**This response was generated by AI Assistant**",
-        'ai_confidence_enabled' => !empty($settings['ai_confidence_enabled']) && $settings['ai_confidence_enabled'] === 'on',
+        'ai_confidence_enabled' => $isOn('ai_confidence_enabled', false),
 
         // Training & Customer Insights
-        'enable_ticket_training' => !empty($settings['enable_ticket_training']),
-        'enable_customer_insights' => !empty($settings['enable_customer_insights']),
+        'enable_ticket_training' => $isOn('enable_ticket_training', true),
+        'enable_customer_insights' => $isOn('enable_customer_insights', true),
 
         // Admin Escalation
         'admin_notification_email' => $settings['admin_notification_email'] ?? '',
-        'escalation_auto_notify' => !empty($settings['escalation_auto_notify']),
+        'escalation_auto_notify' => $isOn('escalation_auto_notify', true),
+
+        // Autopilot & Context Settings (previously omitted!)
+        'autopilot_departments' => $settings['autopilot_departments'] ?? '',
+        'autopilot_delay' => (int) ($settings['autopilot_delay'] ?? 0),
+        'autopilot_status' => !empty($settings['autopilot_status']) ? $settings['autopilot_status'] : 'Answered',
+        'include_admin_notes' => $isOn('include_admin_notes', true),
+
+        // Autonomous Agent Controls
+        'agent_enabled' => $isOn('agent_enabled', true),
+        'agent_allow_safe_actions' => $isOn('agent_allow_safe_actions', true),
+        'agent_allow_service_actions' => $isOn('agent_allow_service_actions', false),
+        'agent_allow_panel_checks' => $isOn('agent_allow_panel_checks', true),
+        'agent_uncertain_behavior' => !empty($settings['agent_uncertain_behavior']) ? $settings['agent_uncertain_behavior'] : 'draft_note',
+        'agent_max_steps' => max(2, min(10, (int) ($settings['agent_max_steps'] ?? 6))),
     ];
 }
 
@@ -1381,31 +1519,56 @@ function analyze_ticket_content($message, $ticket_id)
 
 function detect_mood($message)
 {
-    $message_lower = strtolower($message);
+    $raw = (string) $message;
+    $message_lower = function_exists('mb_strtolower') ? mb_strtolower($raw, 'UTF-8') : strtolower($raw);
 
     $mood_indicators = [
-        'angry' => ['angry', 'mad', 'pissed', 'furious', 'outrageous', 'ridiculous'],
-        'frustrated' => ['frustrated', 'annoying', 'disappointed', 'fed up', 'sick of'],
-        'urgent' => ['urgent', 'asap', 'emergency', 'immediately', 'right now'],
-        'satisfied' => ['thanks', 'thank you', 'appreciate', 'great', 'awesome', 'perfect'],
-        'calm' => ['hello', 'hi', 'please', 'could you', 'would you'],
+        'angry' => [
+            'angry', 'mad', 'pissed', 'furious', 'outrageous', 'ridiculous',
+            'scam', 'useless', 'terrible', 'worst', 'refund me', 'cancel my account',
+            'বিরক্ত', 'ফালতু', 'বাজে সেবা'
+        ],
+        'frustrated' => [
+            'frustrated', 'annoying', 'annoyed', 'disappointed', 'fed up', 'sick of',
+            'still not working', 'still down', 'same issue', 'same problem', 'already tried',
+            'not fixed', 'nobody replied', 'waiting for hours', 'again and again', '3rd time',
+            'এখনো ঠিক হয়নি', 'কাজ করছে না', 'একই সমস্যা', 'আগেই বলেছি'
+        ],
+        'urgent' => [
+            'urgent', 'asap', 'emergency', 'immediately', 'right now', 'site is down',
+            'website down', 'server down', 'production', 'critical', 'জরুরি', 'এখনই'
+        ],
+        'satisfied' => ['thanks', 'thank you', 'appreciate', 'great', 'awesome', 'perfect', 'ধন্যবাদ'],
+        'calm' => ['hello', 'hi', 'please', 'could you', 'would you', 'kindly'],
         'neutral' => ['question', 'inquiry', 'help with', 'information']
     ];
 
+    $use_mb_strpos = function_exists('mb_strpos');
     $scores = [];
     foreach ($mood_indicators as $mood => $indicators) {
         $score = 0;
         foreach ($indicators as $indicator) {
-            if (strpos($message_lower, $indicator) !== false) {
+            $found = $use_mb_strpos
+                ? mb_strpos($message_lower, $indicator, 0, 'UTF-8') !== false
+                : strpos($message_lower, $indicator) !== false;
+            if ($found) {
                 $score++;
             }
         }
         $scores[$mood] = $score;
     }
 
+    // Prioritize negative/urgent signals over polite words ("please fix my site, it's been down for hours")
+    foreach (['angry', 'urgent', 'frustrated', 'satisfied', 'calm', 'neutral'] as $priority_mood) {
+        if (!empty($scores[$priority_mood]) && $scores[$priority_mood] >= 1) {
+            if (in_array($priority_mood, ['angry', 'urgent', 'frustrated'], true)) {
+                return $priority_mood;
+            }
+        }
+    }
+
     $detected_mood = 'neutral';
     $max_score = 0;
-
     foreach ($scores as $mood => $score) {
         if ($score > $max_score) {
             $max_score = $score;
@@ -1949,145 +2112,66 @@ function get_tone_guidance($mood)
 
 function call_gemini_api($prompt, $config, $context = 'ticket_reply', $ticket_id = null)
 {
-    @set_time_limit(60); // Give script more time for API retries
-    $api_key = $config['gemini_api_key'];
-    $model = $config['gemini_model'] ?? 'gemini-1.5-flash';
-    $api_url = "https://generativelanguage.googleapis.com/v1/models/{$model}:generateContent?key={$api_key}";
-    $max_retries = 3;
-    $attempts = 0;
-    $response_data = null;
-    $last_error = '';
+    $api_key = $config['gemini_api_key'] ?? '';
+    $model = $config['gemini_model'] ?? 'gemini-2.5-flash';
 
-    // 🧠 Load custom AI behavior / features from configuration
-    $custom_instruction = trim($config['custom_instructions'] ?? '');
-    
+    $custom_instruction = trim((string) ($config['custom_instructions'] ?? ''));
     $system_instruction = "You are an AI support assistant. ";
-    if (!empty($custom_instruction)) {
+    if ($custom_instruction !== '') {
         $system_instruction .= "Follow these specific instructions: " . $custom_instruction . "\n\n";
     } else {
         $system_instruction .= "Your job is to generate helpful, clear, and professional replies.\n\n";
     }
 
-    $system_instruction .= "CRITICAL: You MUST include a confidence score (0.0–1.0) based on your certainty.
-You MUST return ONLY valid JSON in this exact format:
+    $system_instruction .= "CRITICAL: Return ONLY valid JSON in this exact format:
 {
-  \"reply\": \"Your helpful message to the customer\",
-  \"confidence\": 0.0–1.0
+  \"reply\": \"Your helpful message\",
+  \"confidence\": 0.85
 }";
 
-    // 🧩 Combine prompt with config instruction
-    $instruction = "{$system_instruction}\n\nCustomer message:\n{$prompt}";
+    $payload = [
+        'systemInstruction' => [
+            'parts' => [['text' => $system_instruction]]
+        ],
+        'contents' => [
+            ['role' => 'user', 'parts' => [['text' => $prompt]]]
+        ],
+        'generationConfig' => [
+            'temperature' => (float) ($config['temperature'] ?? 0.4),
+            'maxOutputTokens' => max(800, (int) ($config['max_tokens'] ?? 2048)),
+            'responseMimeType' => 'application/json',
+        ]
+    ];
 
-    $start_time = microtime(true);
-
-    while ($attempts < $max_retries) {
-        $attempts++;
-
-        $data = [
-            'contents' => [['parts' => [['text' => $instruction]]]],
-            'generationConfig' => [
-                'temperature' => (float) ($config['temperature'] ?? 0.5),
-                'maxOutputTokens' => (int) ($config['max_tokens'] ?? 600),
-            ]
-        ];
-
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $api_url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode($data),
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-            CURLOPT_TIMEOUT => 45,
-        ]);
-
-        $response = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curl_error = curl_error($ch);
-        curl_close($ch);
-
-        $response_time = round(microtime(true) - $start_time, 3);
-
-        // ❌ Handle CURL or HTTP errors
-        if ($curl_error) {
-            $last_error = "CURL Error: $curl_error";
-            log_api_call($api_url, $data, $response, $http_code, $curl_error, $response_time, $ticket_id, 'error', $last_error);
-            continue;
-        }
-        if ($http_code !== 200) {
-            $last_error = "HTTP Error $http_code";
-            log_api_call($api_url, $data, $response, $http_code, null, $response_time, $ticket_id, 'error', $last_error);
-
-            // 🛑 If rate limited (429) or server error (503), wait before retrying
-            if ($http_code == 429 || $http_code == 503) {
-                // Wait 4s then 10s for 429
-                $wait_multiplier = ($http_code == 429) ? 4 : 2;
-                $wait_time = pow($wait_multiplier, $attempts) * 1000000;
-                usleep($wait_time);
-            }
-            continue;
-        }
-
-        $response_data = json_decode($response, true);
-        if (!isset($response_data['candidates'][0]['content']['parts'][0]['text'])) {
-            $last_error = 'Unexpected Gemini API format.';
-            log_api_call($api_url, $data, $response, $http_code, null, $response_time, $ticket_id, 'error', $last_error);
-            continue;
-        }
-
-        // 🧹 --- CLEAN & PARSE GEMINI RESPONSE ---
-        $raw_text = trim($response_data['candidates'][0]['content']['parts'][0]['text']);
-        $confidence = null;
-
-        // Remove possible markdown code blocks
-        $clean_text = preg_replace('/```(json)?/i', '', $raw_text);
-        $clean_text = str_replace('```', '', $clean_text);
-        $clean_text = trim($clean_text);
-
-        // Try decoding JSON
-        $parsed = json_decode($clean_text, true);
-        if (json_last_error() === JSON_ERROR_NONE && isset($parsed['reply'])) {
-            $ai_text = trim($parsed['reply']);
-            $confidence = isset($parsed['confidence']) ? (float) $parsed['confidence'] : null;
-        } else {
-            // fallback for malformed JSON
-            $ai_text = preg_replace('/^{\s*"reply"\s*:\s*"|"\s*,\s*"confidence".*$/is', '', $clean_text);
-            $ai_text = preg_replace('/["{}]/', '', $ai_text);
-            $ai_text = trim($ai_text);
-        }
-
-        // ✅ Log success
-        log_api_call($api_url, $data, $response_data, $http_code, null, $response_time, $ticket_id, 'success', null);
-
+    $res = neko_gemini_http_post($model, $api_key, $payload, $ticket_id);
+    if (empty($res['success'])) {
         return [
-            'success' => true,
-            'response' => $ai_text,
-            'confidence' => $confidence,
+            'success' => false,
+            'error' => 'Gemini API failed: ' . ($res['error'] ?? 'Unknown error'),
             'model_used' => $model,
-            'http_code' => $http_code,
-            'attempts' => $attempts,
-            'full_response' => $response_data
+            'http_code' => $res['http_code'] ?? 0,
+            'response_data' => $res['response_data'] ?? null,
         ];
     }
 
-    // ❌ All retries failed
-    log_api_call(
-        $api_url,
-        $data ?? [],
-        $response_data ?? [],
-        $http_code ?? 0,
-        $last_error,
-        round(microtime(true) - $start_time, 3),
-        $ticket_id,
-        'error',
-        $last_error
-    );
+    $raw_text = trim((string) ($res['data']['candidates'][0]['content']['parts'][0]['text'] ?? ''));
+    $parsed = neko_parse_agent_json($raw_text);
+    if ($parsed !== null) {
+        $ai_text = trim((string) $parsed['reply']);
+        $confidence = isset($parsed['confidence']) ? (float) $parsed['confidence'] : null;
+    } else {
+        $ai_text = $raw_text;
+        $confidence = 0.6;
+    }
 
     return [
-        'success' => false,
-        'error' => "Gemini API failed: {$last_error}",
-        'model_used' => $model,
-        'response_data' => $response_data
+        'success' => true,
+        'response' => $ai_text,
+        'confidence' => $confidence,
+        'model_used' => $res['model_used'] ?? $model,
+        'http_code' => $res['http_code'] ?? 200,
+        'attempts' => $res['attempts'] ?? 1,
+        'full_response' => $res['data'],
     ];
 }
 
@@ -2433,28 +2517,45 @@ function search_whmcs_kb($message, $limit = 3)
 
 add_hook('AfterCronJob', 1, function ($vars) {
     $config = get_gemini_config();
-    if (empty($config['auto_reply_enabled'])) return;
+    if (empty($config['auto_reply_enabled'])) {
+        return;
+    }
 
     $now = date('Y-m-d H:i:s');
     $pending_replies = Capsule::table('mod_gemini_reply_queue')
         ->where('status', 'pending')
         ->where('scheduled_at', '<=', $now)
-        ->limit(10) // process in batches
+        ->limit(10)
         ->get();
 
     foreach ($pending_replies as $reply) {
         Capsule::table('mod_gemini_reply_queue')->where('id', $reply->id)->update(['status' => 'processing']);
-        
-        $analysis = analyze_ticket_content($reply->user_message, $reply->ticket_id);
-        $ai_response = generate_ai_ticket_response($reply->user_message, $reply->ticket_id, $analysis);
 
-        if ($ai_response && $ai_response['success']) {
-            add_ticket_reply($reply->ticket_id, $ai_response, $analysis);
-            Capsule::table('mod_gemini_reply_queue')->where('id', $reply->id)->update(['status' => 'completed']);
-            logActivity("Gemini AI: Processed queued autopilot reply for ticket #{$reply->ticket_id}");
-        } else {
-            Capsule::table('mod_gemini_reply_queue')->where('id', $reply->id)->update(['status' => 'failed']);
-            logActivity("Gemini AI: Failed to process queued autopilot reply for ticket #{$reply->ticket_id} - " . ($ai_response['error'] ?? 'Unknown error'));
+        $ticket = Capsule::table('tbltickets')->where('id', $reply->ticket_id)->first();
+        if (!$ticket || strcasecmp((string) $ticket->status, 'Closed') === 0) {
+            Capsule::table('mod_gemini_reply_queue')->where('id', $reply->id)->update(['status' => 'cancelled']);
+            continue;
         }
+
+        // Skip if ticket was escalated to human or if staff already replied while queued
+        $analysis_row = Capsule::table('mod_gemini_ticket_analysis')->where('ticket_id', $reply->ticket_id)->first();
+        $staff_replied = Capsule::table('tblticketreplies')
+            ->where('tid', $reply->ticket_id)
+            ->where('admin', '!=', '')
+            ->where('date', '>', $reply->created_at)
+            ->exists();
+
+        if (($analysis_row && !empty($analysis_row->needs_human)) || $staff_replied) {
+            Capsule::table('mod_gemini_reply_queue')->where('id', $reply->id)->update(['status' => 'cancelled']);
+            logActivity("Neko AI: Cancelled queued reply for ticket #{$reply->ticket_id} (already escalated or staff replied)");
+            continue;
+        }
+
+        $analysis = analyze_ticket_content($reply->user_message, $reply->ticket_id);
+        $solved = neko_execute_autopilot_solve($reply->ticket_id, $reply->user_message, $analysis, $config);
+
+        Capsule::table('mod_gemini_reply_queue')->where('id', $reply->id)->update([
+            'status' => $solved ? 'completed' : 'held_for_human'
+        ]);
     }
 });

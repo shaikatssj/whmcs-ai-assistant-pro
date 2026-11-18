@@ -5,12 +5,15 @@ if (!defined("WHMCS")) {
 
 use WHMCS\Database\Capsule;
 
+require_once __DIR__ . '/includes/agent_tools.php';
+require_once __DIR__ . '/includes/agent_runner.php';
+
 function gemini_ai_assistant_config()
 {
     return [
         'name' => 'Neko AI Assistant',
-        'description' => 'AI-powered ticket assistant with auto-reply, mood detection, customer insights, ticket training, admin escalation, and smart response generation',
-        'version' => '3.0',
+        'description' => 'Autonomous WHMCS AI support agent with live diagnostics, function-calling tools, mood detection, customer insights, ticket training, and smart escalation',
+        'version' => '4.0',
         'author' => 'AI Assistant Pro',
         'fields' => [
             'gemini_api_key' => [
@@ -24,8 +27,8 @@ function gemini_ai_assistant_config()
                 'FriendlyName' => 'Gemini Model',
                 'Type' => 'text',
                 'Size' => '100',
-                'Default' => 'gemini-1.5-flash',
-                'Description' => 'The model name to use (e.g., gemini-1.5-flash, gemini-3.1-flash). Ensure this model is available in your account.',
+                'Default' => 'gemini-2.5-flash',
+                'Description' => 'The Gemini model to use (e.g., gemini-2.5-flash, gemini-2.5-pro). Tool-calling uses Gemini v1beta.',
             ],
             'assistant_name' => [
                 'FriendlyName' => 'Assistant Name',
@@ -38,36 +41,74 @@ function gemini_ai_assistant_config()
                 'FriendlyName' => 'Auto Reply',
                 'Type' => 'yesno',
                 'Default' => '1',
-                'Description' => 'Enable automatic ticket replies',
+                'Description' => 'Enable automatic ticket handling on new tickets & replies',
+            ],
+            'agent_enabled' => [
+                'FriendlyName' => 'Autonomous Agent Mode (Tool Use)',
+                'Type' => 'yesno',
+                'Default' => '1',
+                'Description' => 'Allow Neko AI to inspect full ticket history, services, invoices, domains, DNS, SSL/HTTP, and module logs via Gemini function calling before replying.',
+            ],
+            'agent_allow_safe_actions' => [
+                'FriendlyName' => 'Allow Safe Self-Service Actions',
+                'Type' => 'yesno',
+                'Default' => '1',
+                'Description' => 'Allow agent in Autopilot/Solve mode to resend welcome/invoice emails, apply client credit, update domain lock/NS, request EPP, and route tickets.',
+            ],
+            'agent_allow_service_actions' => [
+                'FriendlyName' => 'Allow Service/Order Provision Actions',
+                'Type' => 'yesno',
+                'Default' => '0',
+                'Description' => 'Allow agent to unsuspend paid non-abuse services, provision paid pending services, accept paid orders, and run VPS power actions (reboot/boot/shutdown) when requested.',
+            ],
+            'agent_allow_panel_checks' => [
+                'FriendlyName' => 'Allow Live Control Panel Checks',
+                'Type' => 'yesno',
+                'Default' => '1',
+                'Description' => 'Allow read-only live checks on cPanel/WHM and DirectAdmin servers configured in WHMCS.',
+            ],
+            'agent_uncertain_behavior' => [
+                'FriendlyName' => 'When Agent Cannot Solve / Low Confidence',
+                'Type' => 'dropdown',
+                'Options' => 'draft_note,escalate_silent,escalate_notify',
+                'Default' => 'draft_note',
+                'Description' => 'draft_note = Save diagnostic Admin Note + draft without replying to client (Recommended); escalate_silent = Flag high priority + notify admin silently; escalate_notify = Escalate + email client notice.',
+            ],
+            'agent_max_steps' => [
+                'FriendlyName' => 'Agent Max Reasoning Steps',
+                'Type' => 'text',
+                'Size' => '5',
+                'Default' => '6',
+                'Description' => 'Maximum tool-calling turns per ticket (2-10).',
             ],
             'confidence_threshold' => [
                 'FriendlyName' => 'Confidence Threshold',
                 'Type' => 'text',
                 'Size' => '5',
                 'Default' => '0.7',
-                'Description' => 'Minimum confidence score (0.1-1.0) for auto-reply',
+                'Description' => 'Minimum verified confidence score (0.1-1.0) required before sending a public auto-reply',
             ],
             'max_tokens' => [
                 'FriendlyName' => 'Max Response Length',
                 'Type' => 'text',
                 'Size' => '5',
-                'Default' => '500',
-                'Description' => 'Maximum tokens for AI responses',
+                'Default' => '2048',
+                'Description' => 'Maximum output tokens for AI responses (recommended 1500-2048 for agent mode)',
             ],
             'temperature' => [
                 'FriendlyName' => 'AI Temperature',
                 'Type' => 'text',
                 'Size' => '5',
-                'Default' => '0.7',
-                'Description' => 'AI creativity (0.1-1.0) - lower for more consistent responses',
+                'Default' => '0.4',
+                'Description' => 'AI creativity (0.1-1.0) - lower (0.2-0.4) is more accurate for diagnostics',
             ],
             'custom_instructions' => [
                 'FriendlyName' => 'Custom Instructions',
                 'Type' => 'textarea',
                 'Rows' => 8,
                 'Cols' => 80,
-                'Default' => 'You are a helpful support assistant for a web hosting company. Be professional, empathetic, and solution-oriented.',
-                'Description' => 'Custom instructions for the AI behavior',
+                'Default' => 'You are a helpful Tier-2 support engineer for a web hosting company. Always verify facts with tools before replying, be empathetic, and give concrete solutions.',
+                'Description' => 'Custom instructions and company policies for the AI agent',
             ],
             'training_tickets_limit' => [
                 'FriendlyName' => 'Training Tickets Limit',
@@ -100,8 +141,8 @@ function gemini_ai_assistant_config()
             'ai_confidence_enabled' => [
                 'FriendlyName' => 'Show Confidence Level',
                 'Type' => 'yesno',
-                'Default' => '1',
-                'Description' => 'Show confidence percentage in footer (e.g., Confidence: 87%).',
+                'Default' => '0',
+                'Description' => 'Show confidence percentage in public footer (recommended OFF so customers do not see internal scores).',
             ],
 
             'enable_ticket_training' => [
@@ -137,7 +178,7 @@ function gemini_ai_assistant_config()
                 'Type' => 'text',
                 'Size' => '50',
                 'Default' => '',
-                'Description' => 'Comma-separated department IDs to enable Autopilot (e.g., 1,3,4). Leave blank for none.',
+                'Description' => 'Comma-separated department IDs to enable Autopilot (e.g., 1,3,4). Leave blank to allow all departments.',
             ],
             'autopilot_delay' => [
                 'FriendlyName' => 'Autopilot Delay (Minutes)',
@@ -262,6 +303,9 @@ function gemini_ai_assistant_activate()
             });
         }
 
+        // Agent Actions Audit Log
+        neko_ensure_agent_tables();
+
         return [
             'status' => 'success',
             'description' => 'Neko AI Assistant activated successfully with all database tables.'
@@ -272,6 +316,11 @@ function gemini_ai_assistant_activate()
             'description' => 'Activation failed: ' . $e->getMessage()
         ];
     }
+}
+
+function gemini_ai_assistant_upgrade($vars)
+{
+    neko_ensure_agent_tables();
 }
 
 function gemini_ai_assistant_deactivate()
@@ -319,8 +368,14 @@ function gemini_ai_assistant_clientarea($vars)
             $lang = $_POST['reply_lang'] ?? 'auto';
             $current_message = $_POST['current_message'] ?? '';
 
-            // Get ticket message(s) for context
-            $message = Capsule::table('tbltickets')->where('id', $ticket_id)->value('message');
+            // Build public conversation history (strictly excluding admin notes)
+            $history_lines = ["[Customer Initial Message]:\n" . trim((string) $ticket->message)];
+            $replies = Capsule::table('tblticketreplies')->where('tid', $ticket_id)->orderBy('id', 'asc')->get();
+            foreach ($replies as $r) {
+                $speaker = !empty($r->admin) ? 'Support' : 'Customer';
+                $history_lines[] = "[{$speaker}]:\n" . trim((string) $r->message);
+            }
+            $message = implode("\n\n", $history_lines);
 
             $analysis = analyze_ticket_content($message, $ticket_id);
             $ai_response = generate_ai_ticket_response($message, $ticket_id, $analysis, $mode, $current_message, $lang, 'client');
@@ -414,10 +469,16 @@ function handle_admin_actions($vars)
         redirect_with_message("Cleared {$deleted} training cache entries. You can re-train from tickets.");
     } elseif ($_POST['action'] == 'resolve_escalation') {
         $escalation_id = (int) $_POST['escalation_id'];
+        $esc = Capsule::table('mod_gemini_escalations')->where('id', $escalation_id)->first();
         Capsule::table('mod_gemini_escalations')->where('id', $escalation_id)->update([
             'resolved' => true,
             'resolved_at' => date('Y-m-d H:i:s'),
         ]);
+        if ($esc) {
+            Capsule::table('mod_gemini_ticket_analysis')
+                ->where('ticket_id', $esc->ticket_id)
+                ->update(['needs_human' => 0]);
+        }
         redirect_with_message('Escalation marked as resolved.');
     }
 }
@@ -559,6 +620,15 @@ function display_admin_interface($vars)
         ->limit(50)
         ->get();
     $active_escalations = Capsule::table('mod_gemini_escalations')->where('resolved', false)->count();
+
+    // Agent Actions audit log
+    neko_ensure_agent_tables();
+    $agent_actions = Capsule::table('mod_gemini_agent_actions')
+        ->leftJoin('tbltickets', 'mod_gemini_agent_actions.ticket_id', '=', 'tbltickets.id')
+        ->select('mod_gemini_agent_actions.*', 'tbltickets.tid')
+        ->orderBy('mod_gemini_agent_actions.id', 'desc')
+        ->limit(100)
+        ->get();
     ?>
 
     <div class="container-fluid neko-ai-container">
@@ -700,6 +770,11 @@ function display_admin_interface($vars)
                                 <?php if ($active_escalations > 0): ?>
                                     <span class="badge" style="background: var(--danger); color: white; margin-left: 4px;"><?php echo $active_escalations; ?></span>
                                 <?php endif; ?>
+                            </a>
+                        </li>
+                        <li role="presentation">
+                            <a href="#agent-actions" aria-controls="agent-actions" role="tab" data-toggle="tab">
+                                <i class="fas fa-tools"></i> Agent Actions
                             </a>
                         </li>
                     </ul>
@@ -1224,6 +1299,63 @@ function display_admin_interface($vars)
                                                         <td colspan="9" style="text-align: center; color: var(--gray); padding: 30px;">
                                                             <i class="fas fa-check-circle" style="font-size: 2em; margin-bottom: 10px; display: block; color: var(--success);"></i>
                                                             No escalations recorded. All clear!
+                                                        </td>
+                                                    </tr>
+                                                <?php endif; ?>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Agent Actions Tab -->
+                        <div role="tabpanel" class="tab-pane" id="agent-actions">
+                            <div class="neko-card">
+                                <div class="card-header">
+                                    <h4><i class="fas fa-tools"></i> Autonomous Agent Tool &amp; Action Audit Log (Last 100)</h4>
+                                </div>
+                                <div class="card-body">
+                                    <div class="table-responsive">
+                                        <table class="table table-hover neko-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>Ticket</th>
+                                                    <th>Tool</th>
+                                                    <th>Type</th>
+                                                    <th>Mode</th>
+                                                    <th>Status</th>
+                                                    <th>Result Excerpt</th>
+                                                    <th>Date</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <?php foreach ($agent_actions as $act): ?>
+                                                    <tr>
+                                                        <td><code><?php echo htmlspecialchars($act->tid ?? ('#' . $act->ticket_id)); ?></code></td>
+                                                        <td><code><?php echo htmlspecialchars($act->tool_name); ?></code></td>
+                                                        <td>
+                                                            <span class="label label-<?php echo $act->action_type === 'action' ? 'primary' : ($act->action_type === 'escalate' ? 'danger' : 'default'); ?>">
+                                                                <?php echo htmlspecialchars($act->action_type); ?>
+                                                            </span>
+                                                        </td>
+                                                        <td><?php echo htmlspecialchars($act->triggered_by); ?></td>
+                                                        <td>
+                                                            <span class="status-badge status-<?php echo $act->status === 'success' ? 'success' : 'error'; ?>">
+                                                                <?php echo htmlspecialchars($act->status); ?>
+                                                            </span>
+                                                        </td>
+                                                        <td class="message-preview" style="max-width: 380px; word-break: break-word;">
+                                                            <small><?php echo htmlspecialchars(substr((string) $act->tool_result, 0, 180)); ?></small>
+                                                        </td>
+                                                        <td><?php echo date('M j, H:i', strtotime($act->created_at)); ?></td>
+                                                    </tr>
+                                                <?php endforeach; ?>
+                                                <?php if ($agent_actions->isEmpty()): ?>
+                                                    <tr>
+                                                        <td colspan="7" style="text-align: center; color: var(--gray); padding: 30px;">
+                                                            <i class="fas fa-robot" style="font-size: 2em; margin-bottom: 10px; display: block;"></i>
+                                                            No agent tool calls recorded yet. Open or reply to a ticket with Agent Mode enabled.
                                                         </td>
                                                     </tr>
                                                 <?php endif; ?>
