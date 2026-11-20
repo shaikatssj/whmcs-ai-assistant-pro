@@ -6,10 +6,28 @@ if (!defined("WHMCS")) {
 use WHMCS\Database\Capsule;
 
 /**
- * Ensure the agent actions audit table exists (safe for upgrades without re-activation).
+ * Redact API keys, WHM access hashes, and Authorization headers from logs/outputs.
+ */
+function neko_redact_secrets($text)
+{
+    $str = (string) $text;
+    $str = preg_replace('/([?&]key=)[^&\s"\']+/i', '$1[REDACTED]', $str);
+    $str = preg_replace('/(Authorization:\s*(?:whm|Basic|Bearer)\s+)[^\r\n"\']+/i', '$1[REDACTED]', $str);
+    $str = preg_replace('/AIza[0-9A-Za-z\-_]{20,}/', '[REDACTED_API_KEY]', $str);
+    return $str;
+}
+
+/**
+ * Ensure the agent actions audit table and upgraded log columns exist safely.
  */
 function neko_ensure_agent_tables()
 {
+    static $ensured = false;
+    if ($ensured) {
+        return;
+    }
+    $ensured = true;
+
     try {
         if (!Capsule::schema()->hasTable('mod_gemini_agent_actions')) {
             Capsule::schema()->create('mod_gemini_agent_actions', function ($table) {
@@ -25,8 +43,27 @@ function neko_ensure_agent_tables()
                 $table->timestamp('created_at')->useCurrent();
             });
         }
+
+        if (Capsule::schema()->hasTable('mod_gemini_ai_logs') && !Capsule::schema()->hasColumn('mod_gemini_ai_logs', 'admin_feedback')) {
+            Capsule::schema()->table('mod_gemini_ai_logs', function ($table) {
+                $table->string('admin_feedback', 20)->nullable()->after('response_type');
+            });
+        }
+
+        if (Capsule::schema()->hasTable('mod_gemini_api_logs')) {
+            if (!Capsule::schema()->hasColumn('mod_gemini_api_logs', 'model_used')) {
+                Capsule::schema()->table('mod_gemini_api_logs', function ($table) {
+                    $table->string('model_used', 80)->nullable()->after('api_endpoint');
+                });
+            }
+            if (!Capsule::schema()->hasColumn('mod_gemini_api_logs', 'tokens_used')) {
+                Capsule::schema()->table('mod_gemini_api_logs', function ($table) {
+                    $table->integer('tokens_used')->unsigned()->default(0)->after('response_time');
+                });
+            }
+        }
     } catch (\Exception $e) {
-        logActivity("Neko AI: Failed ensuring mod_gemini_agent_actions table - " . $e->getMessage());
+        logActivity("Neko AI: Failed ensuring agent tables/columns - " . $e->getMessage());
     }
 }
 
@@ -37,7 +74,7 @@ function neko_log_agent_action($ticket_id, $client_id, $tool_name, $args, $resul
 {
     try {
         neko_ensure_agent_tables();
-        $result_json = json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $result_json = neko_redact_secrets((string) json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
         if (strlen($result_json) > 16000) {
             $result_json = substr($result_json, 0, 16000) . '... [truncated]';
         }
@@ -45,7 +82,7 @@ function neko_log_agent_action($ticket_id, $client_id, $tool_name, $args, $resul
             'ticket_id' => (int) $ticket_id,
             'client_id' => (int) $client_id,
             'tool_name' => substr((string) $tool_name, 0, 80),
-            'tool_args' => json_encode($args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            'tool_args' => neko_redact_secrets((string) json_encode($args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
             'tool_result' => $result_json,
             'action_type' => $action_type,
             'status' => $status,
@@ -248,6 +285,42 @@ function neko_get_agent_tool_declarations(array $config, $mode = 'autopilot')
                 'required' => ['query'],
             ],
         ],
+        [
+            'name' => 'get_client_addons_and_cancellations',
+            'description' => 'List service addons (e.g. Dedicated IP, SSL, Backup) and any pending/processed cancellation requests for this customer.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => (object) [],
+            ],
+        ],
+        [
+            'name' => 'check_email_deliverability',
+            'description' => 'Audit MX, SPF, DMARC (_dmarc), and common DKIM DNS records for a domain to diagnose email sending, receiving, or spam/bounce problems.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'domain' => [
+                        'type' => 'string',
+                        'description' => 'Domain name to audit (e.g. example.com).',
+                    ],
+                ],
+                'required' => ['domain'],
+            ],
+        ],
+        [
+            'name' => 'check_domain_whois',
+            'description' => 'Check domain RDAP/WHOIS availability, registrar status flags (e.g. clientHold, serverHold, pendingTransfer), and expiry dates.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'domain' => [
+                        'type' => 'string',
+                        'description' => 'Domain name to inspect (e.g. example.com).',
+                    ],
+                ],
+                'required' => ['domain'],
+            ],
+        ],
     ];
 
     if ($allow_panel_checks) {
@@ -347,6 +420,18 @@ function neko_get_agent_tool_declarations(array $config, $mode = 'autopilot')
                     'domain_id' => ['type' => 'integer'],
                 ],
                 'required' => ['domain_id'],
+            ],
+        ];
+        $declarations[] = [
+            'name' => 'toggle_domain_id_protect',
+            'description' => 'Toggle WHOIS ID Protection on/off for a domain owned by this customer when explicitly requested.',
+            'parameters' => [
+                'type' => 'object',
+                'properties' => [
+                    'domain_id' => ['type' => 'integer'],
+                    'enabled' => ['type' => 'boolean', 'description' => 'true to enable, false to disable.'],
+                ],
+                'required' => ['domain_id', 'enabled'],
             ],
         ];
         $declarations[] = [
@@ -509,6 +594,18 @@ function neko_execute_agent_tool($tool_name, array $args, array $context)
                 $result = neko_tool_search_similar_tickets($ticket_id, (string) ($args['query'] ?? ''));
                 break;
 
+            case 'get_client_addons_and_cancellations':
+                $result = neko_tool_get_client_addons_and_cancellations($client_id);
+                break;
+
+            case 'check_email_deliverability':
+                $result = neko_tool_check_email_deliverability((string) ($args['domain'] ?? ''));
+                break;
+
+            case 'check_domain_whois':
+                $result = neko_tool_check_domain_whois((string) ($args['domain'] ?? ''));
+                break;
+
             case 'check_server_account_status':
                 if (!$allow_panel_checks) {
                     $result = ['ok' => false, 'error' => 'Live control panel checks are disabled in module settings.'];
@@ -567,6 +664,16 @@ function neko_execute_agent_tool($tool_name, array $args, array $context)
                     return $result;
                 }
                 $result = neko_tool_request_domain_epp($client_id, (int) ($args['domain_id'] ?? 0));
+                break;
+
+            case 'toggle_domain_id_protect':
+                $action_type = 'action';
+                if (!$allow_safe_actions) {
+                    $result = ['ok' => false, 'error' => 'Safe actions are disabled or running in read-only preview mode.'];
+                    neko_log_agent_action($ticket_id, $client_id, $tool_name, $args, $result, $action_type, 'blocked', $mode);
+                    return $result;
+                }
+                $result = neko_tool_toggle_domain_id_protect($client_id, (int) ($args['domain_id'] ?? 0), !empty($args['enabled']));
                 break;
 
             case 'update_ticket_metadata':
@@ -1387,11 +1494,31 @@ function neko_tool_search_knowledgebase($query)
         }
     } catch (\Exception $e) {}
 
+    $predefined_results = [];
+    try {
+        $pre_query = Capsule::table('tblticketpredefinedreplies');
+        if (!empty($keywords)) {
+            $pre_query->where(function ($q) use ($keywords) {
+                foreach ($keywords as $kw) {
+                    $q->orWhere('name', 'LIKE', "%{$kw}%")
+                      ->orWhere('reply', 'LIKE', "%{$kw}%");
+                }
+            });
+        }
+        foreach ($pre_query->limit(4)->get() as $pr) {
+            $predefined_results[] = [
+                'name' => $pr->name,
+                'reply' => substr(trim(strip_tags((string) $pr->reply)), 0, 1000),
+            ];
+        }
+    } catch (\Exception $e) {}
+
     return [
         'ok' => true,
         'keywords_used' => $keywords,
         'qa_pairs' => $qa_results,
         'kb_articles' => $kb_results,
+        'predefined_replies' => $predefined_results,
     ];
 }
 
@@ -1944,4 +2071,213 @@ function neko_ticket_copilot_snapshot($ticket_id)
         'domain_chips' => $domain_chips,
         'agent_action_count' => $agent_action_count,
     ];
+}
+
+function neko_tool_get_client_addons_and_cancellations($client_id)
+{
+    if ($client_id <= 0) {
+        return ['ok' => true, 'addons' => [], 'cancellations' => []];
+    }
+
+    $addons = [];
+    try {
+        $rows = Capsule::table('tblhostingaddons')
+            ->join('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
+            ->leftJoin('tbladdons', 'tblhostingaddons.addonid', '=', 'tbladdons.id')
+            ->where('tblhosting.userid', $client_id)
+            ->select(
+                'tblhostingaddons.id',
+                'tblhostingaddons.hostingid as service_id',
+                'tblhosting.domain',
+                'tbladdons.name as addon_name',
+                'tblhostingaddons.name as custom_name',
+                'tblhostingaddons.status',
+                'tblhostingaddons.nextduedate',
+                'tblhostingaddons.recurring'
+            )
+            ->orderBy('tblhostingaddons.id', 'desc')
+            ->limit(20)
+            ->get();
+        foreach ($rows as $r) {
+            $addons[] = [
+                'addon_id' => (int) $r->id,
+                'service_id' => (int) $r->service_id,
+                'domain' => $r->domain,
+                'name' => $r->addon_name ?: $r->custom_name,
+                'status' => $r->status,
+                'next_due_date' => $r->nextduedate,
+                'recurring' => $r->recurring,
+            ];
+        }
+    } catch (\Exception $e) {}
+
+    $cancellations = [];
+    try {
+        $crows = Capsule::table('tblcancelrequests')
+            ->join('tblhosting', 'tblcancelrequests.relid', '=', 'tblhosting.id')
+            ->where('tblhosting.userid', $client_id)
+            ->select('tblcancelrequests.id', 'tblcancelrequests.date', 'tblcancelrequests.relid as service_id', 'tblhosting.domain', 'tblcancelrequests.type', 'tblcancelrequests.reason')
+            ->orderBy('tblcancelrequests.id', 'desc')
+            ->limit(10)
+            ->get();
+        $cancellations = $crows->toArray();
+    } catch (\Exception $e) {}
+
+    return [
+        'ok' => true,
+        'addons' => $addons,
+        'cancellation_requests' => $cancellations,
+    ];
+}
+
+function neko_tool_check_email_deliverability($raw_domain)
+{
+    $domain = neko_sanitize_domain($raw_domain);
+    if ($domain === '') {
+        return ['ok' => false, 'error' => 'Invalid domain format.'];
+    }
+
+    $mx_records = [];
+    $mx = @dns_get_record($domain, DNS_MX);
+    if (is_array($mx)) {
+        foreach ($mx as $m) {
+            $mx_records[] = ['priority' => (int) ($m['pri'] ?? 0), 'target' => $m['target'] ?? ''];
+        }
+    }
+
+    $txt = @dns_get_record($domain, DNS_TXT);
+    $spf_records = [];
+    if (is_array($txt)) {
+        foreach ($txt as $t) {
+            $val = (string) ($t['txt'] ?? '');
+            if (stripos($val, 'v=spf1') === 0) {
+                $spf_records[] = $val;
+            }
+        }
+    }
+
+    $dmarc_records = [];
+    $dmarc = @dns_get_record('_dmarc.' . $domain, DNS_TXT);
+    if (is_array($dmarc)) {
+        foreach ($dmarc as $d) {
+            $val = (string) ($d['txt'] ?? '');
+            if (stripos($val, 'v=DMARC1') === 0) {
+                $dmarc_records[] = $val;
+            }
+        }
+    }
+
+    $dkim_found = [];
+    foreach (['default', 'dkim', 'mail', 'google', 'selector1', 'k1'] as $sel) {
+        $dkim = @dns_get_record("{$sel}._domainkey.{$domain}", DNS_TXT);
+        if (is_array($dkim) && !empty($dkim)) {
+            $dkim_found[$sel] = substr((string) ($dkim[0]['txt'] ?? ''), 0, 120);
+        }
+    }
+
+    $issues = [];
+    if (empty($mx_records)) {
+        $issues[] = 'No MX records found — incoming email cannot be delivered.';
+    }
+    if (empty($spf_records)) {
+        $issues[] = 'Missing SPF record (v=spf1) — outgoing mail is likely to land in spam or bounce.';
+    } elseif (count($spf_records) > 1) {
+        $issues[] = 'Multiple SPF records detected (' . count($spf_records) . ') — RFC requires a single combined v=spf1 record (PermError).';
+    }
+    if (empty($dmarc_records)) {
+        $issues[] = 'Missing DMARC record at _dmarc.' . $domain . ' — Gmail/Yahoo/Outlook strongly recommend DMARC.';
+    }
+    if (empty($dkim_found)) {
+        $issues[] = 'No common DKIM selector (default/dkim/mail/google/selector1) detected.';
+    }
+
+    return [
+        'ok' => true,
+        'domain' => $domain,
+        'mx' => $mx_records,
+        'spf' => $spf_records,
+        'dmarc' => $dmarc_records,
+        'dkim_selectors_found' => $dkim_found,
+        'issues_detected' => $issues,
+    ];
+}
+
+function neko_tool_check_domain_whois($raw_domain)
+{
+    $domain = neko_sanitize_domain($raw_domain);
+    if ($domain === '') {
+        return ['ok' => false, 'error' => 'Invalid domain format.'];
+    }
+
+    $rdap_url = 'https://rdap.org/domain/' . rawurlencode($domain);
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $rdap_url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_TIMEOUT => 6,
+        CURLOPT_CONNECTTIMEOUT => 4,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_USERAGENT => 'NekoAI-RDAP/1.0',
+    ]);
+    $resp = curl_exec($ch);
+    $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($http === 200 && $resp) {
+        $data = json_decode($resp, true);
+        if (is_array($data)) {
+            $events = [];
+            foreach (($data['events'] ?? []) as $ev) {
+                if (!empty($ev['eventAction']) && !empty($ev['eventDate'])) {
+                    $events[$ev['eventAction']] = $ev['eventDate'];
+                }
+            }
+            $ns = [];
+            foreach (($data['nameservers'] ?? []) as $n) {
+                if (!empty($n['ldhName'])) {
+                    $ns[] = $n['ldhName'];
+                }
+            }
+            return [
+                'ok' => true,
+                'source' => 'rdap.org',
+                'domain' => $data['ldhName'] ?? $domain,
+                'status_flags' => $data['status'] ?? [],
+                'nameservers' => $ns,
+                'events' => $events,
+            ];
+        }
+    }
+
+    $whmcs_whois = neko_local_api('DomainWhois', ['domain' => $domain]);
+    if (($whmcs_whois['result'] ?? '') === 'success') {
+        return [
+            'ok' => true,
+            'source' => 'whmcs_whois',
+            'domain' => $domain,
+            'status' => $whmcs_whois['status'] ?? 'unknown',
+            'whois_excerpt' => substr(strip_tags((string) ($whmcs_whois['whois'] ?? '')), 0, 1200),
+        ];
+    }
+
+    return ['ok' => false, 'error' => 'Unable to fetch RDAP or WHMCS WHOIS for ' . $domain];
+}
+
+function neko_tool_toggle_domain_id_protect($client_id, $domain_id, $enabled)
+{
+    $domain = Capsule::table('tbldomains')->where('id', $domain_id)->where('userid', $client_id)->first();
+    if (!$domain) {
+        return ['ok' => false, 'error' => 'Domain not found for this client.'];
+    }
+
+    $res = neko_local_api('DomainToggleIDProtect', [
+        'domainid' => $domain_id,
+        'idprotect' => $enabled ? 1 : 0,
+    ]);
+
+    return ($res['result'] ?? '') === 'success'
+        ? ['ok' => true, 'message' => 'ID Protection ' . ($enabled ? 'enabled' : 'disabled') . " for {$domain->domain}."]
+        : ['ok' => false, 'error' => $res['message'] ?? 'DomainToggleIDProtect failed'];
 }

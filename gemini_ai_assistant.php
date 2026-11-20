@@ -28,7 +28,14 @@ function gemini_ai_assistant_config()
                 'Type' => 'text',
                 'Size' => '100',
                 'Default' => 'gemini-2.5-flash',
-                'Description' => 'The Gemini model to use (e.g., gemini-2.5-flash, gemini-2.5-pro). Tool-calling uses Gemini v1beta.',
+                'Description' => 'Primary Gemini model (e.g., gemini-2.5-flash, gemini-2.5-pro). Tool-calling uses Gemini v1beta.',
+            ],
+            'gemini_fallback_model' => [
+                'FriendlyName' => 'Fallback Gemini Model',
+                'Type' => 'text',
+                'Size' => '100',
+                'Default' => 'gemini-2.0-flash',
+                'Description' => 'Optional backup model used automatically if primary model hits 429 rate-limit, 503 overload, or 404 availability errors.',
             ],
             'assistant_name' => [
                 'FriendlyName' => 'Assistant Name',
@@ -646,6 +653,30 @@ function handle_admin_actions($vars)
 
         $_SESSION['neko_bench_result'] = $out;
         redirect_with_message('Diagnostic Bench run completed. Open the Agent Bench tab to view results.');
+    } elseif ($_POST['action'] == 'export_csv') {
+        neko_ensure_agent_tables();
+        $dataset = ($_POST['dataset'] ?? 'agent_actions') === 'ai_logs' ? 'ai_logs' : 'agent_actions';
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="neko_' . $dataset . '_' . date('Ymd_His') . '.csv"');
+        $out = fopen('php://output', 'w');
+        if ($dataset === 'ai_logs') {
+            fputcsv($out, ['ID', 'Ticket ID', 'Response Type', 'Mood', 'Confidence', 'Admin Feedback', 'Created At', 'User Message', 'AI Response']);
+            $rows = Capsule::table('mod_gemini_ai_logs')->orderBy('id', 'desc')->limit(1000)->get();
+            foreach ($rows as $r) {
+                fputcsv($out, [$r->id, $r->ticket_id, $r->response_type, $r->mood_detected, $r->confidence_score, $r->admin_feedback ?? '', $r->created_at, substr((string) $r->user_message, 0, 500), substr((string) $r->ai_response, 0, 1000)]);
+            }
+        } else {
+            fputcsv($out, ['ID', 'Ticket ID', 'Client ID', 'Tool', 'Type', 'Mode', 'Status', 'Created At', 'Args', 'Result']);
+            $rows = Capsule::table('mod_gemini_agent_actions')->orderBy('id', 'desc')->limit(1000)->get();
+            foreach ($rows as $r) {
+                fputcsv($out, [$r->id, $r->ticket_id, $r->client_id, $r->tool_name, $r->action_type, $r->triggered_by, $r->status, $r->created_at, $r->tool_args, substr((string) $r->tool_result, 0, 800)]);
+            }
+        }
+        fclose($out);
+        exit;
     }
 }
 
@@ -1035,6 +1066,47 @@ function display_admin_interface($vars)
                                     </div>
                                 </div>
                             </div>
+
+                            <!-- System Health & Agent Readiness -->
+                            <div class="row" style="margin-top: 15px;">
+                                <div class="col-md-12">
+                                    <div class="neko-card">
+                                        <div class="card-header">
+                                            <h4><i class="fas fa-heartbeat"></i> System Health &amp; Agent Readiness</h4>
+                                        </div>
+                                        <div class="card-body">
+                                            <?php
+                                            $cfg = function_exists('get_gemini_config') ? get_gemini_config() : [];
+                                            $queued_pending = Capsule::table('mod_gemini_reply_queue')->where('status', 'pending')->count();
+                                            $total_agent_runs = Capsule::table('mod_gemini_agent_actions')->count();
+                                            $checks = [
+                                                ['PHP Runtime', PHP_VERSION, version_compare(PHP_VERSION, '7.4.0', '>=')],
+                                                ['cURL + OpenSSL', (extension_loaded('curl') && extension_loaded('openssl')) ? 'Enabled' : 'Missing', extension_loaded('curl') && extension_loaded('openssl')],
+                                                ['Gemini API Key', !empty($cfg['gemini_api_key']) ? 'Configured' : 'Missing', !empty($cfg['gemini_api_key'])],
+                                                ['Primary / Fallback Model', ($cfg['gemini_model'] ?? 'n/a') . ' / ' . (!empty($cfg['gemini_fallback_model']) ? $cfg['gemini_fallback_model'] : 'None'), !empty($cfg['gemini_model'])],
+                                                ['Agent Mode & Policy', (!empty($cfg['agent_enabled']) ? 'ON' : 'OFF') . ' · ' . ($cfg['agent_uncertain_behavior'] ?? 'draft_note'), !empty($cfg['agent_enabled'])],
+                                                ['Pending Cron Queue', $queued_pending . ' queued · ' . $total_agent_runs . ' tool calls logged', true],
+                                            ];
+                                            ?>
+                                            <div class="row">
+                                                <?php foreach ($checks as $chk): ?>
+                                                    <div class="col-md-4 col-sm-6" style="margin-bottom: 10px;">
+                                                        <div style="padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc; display:flex; justify-content:space-between; align-items:center;">
+                                                            <div>
+                                                                <div style="font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 600;"><?php echo htmlspecialchars($chk[0]); ?></div>
+                                                                <div style="font-size: 13px; font-weight: 600; color: #0f172a;"><?php echo htmlspecialchars($chk[1]); ?></div>
+                                                            </div>
+                                                            <span class="status-badge status-<?php echo $chk[2] ? 'success' : 'error'; ?>">
+                                                                <?php echo $chk[2] ? 'OK' : 'Check'; ?>
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                <?php endforeach; ?>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Analytics Tab -->
@@ -1084,6 +1156,27 @@ function display_admin_interface($vars)
                                                 <div class="metric-label">Active QA Pairs</div>
                                                 <div class="metric-value">
                                                     <?php echo Capsule::table('mod_gemini_qa_pairs')->count(); ?></div>
+                                            </div>
+                                            <?php
+                                            $total_tokens = Capsule::schema()->hasColumn('mod_gemini_api_logs', 'tokens_used')
+                                                ? (int) Capsule::table('mod_gemini_api_logs')->sum('tokens_used')
+                                                : 0;
+                                            $rated_pos = Capsule::schema()->hasColumn('mod_gemini_ai_logs', 'admin_feedback')
+                                                ? Capsule::table('mod_gemini_ai_logs')->where('admin_feedback', 'positive')->count()
+                                                : 0;
+                                            $rated_neg = Capsule::schema()->hasColumn('mod_gemini_ai_logs', 'admin_feedback')
+                                                ? Capsule::table('mod_gemini_ai_logs')->where('admin_feedback', 'negative')->count()
+                                                : 0;
+                                            $rated_total = $rated_pos + $rated_neg;
+                                            $approval_pct = $rated_total > 0 ? round(($rated_pos / $rated_total) * 100, 1) : null;
+                                            ?>
+                                            <div class="metric-item">
+                                                <div class="metric-label">Total Tokens Logged</div>
+                                                <div class="metric-value"><?php echo number_format($total_tokens); ?></div>
+                                            </div>
+                                            <div class="metric-item">
+                                                <div class="metric-label">Staff Draft Approval (<?php echo $rated_total; ?> rated)</div>
+                                                <div class="metric-value"><?php echo $approval_pct !== null ? ($approval_pct . '%') : 'No ratings yet'; ?></div>
                                             </div>
                                         </div>
                                     </div>
@@ -1177,12 +1270,20 @@ function display_admin_interface($vars)
                         <!-- Activity Logs Tab -->
                         <div role="tabpanel" class="tab-pane" id="logs">
                             <div class="neko-card">
-                                <div class="card-header">
-                                    <h4><i class="fas fa-history"></i> Recent AI Activity</h4>
+                                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                                    <h4 style="margin:0;"><i class="fas fa-history"></i> Recent AI Activity</h4>
+                                    <div style="display:flex; gap:8px; align-items:center;">
+                                        <input type="text" class="form-control input-sm" placeholder="Filter by TID, mood, or message..." onkeyup="nekoFilterTable(this, 'nekoActivityTable')" style="width:220px;">
+                                        <form method="post" style="margin:0;">
+                                            <input type="hidden" name="action" value="export_csv">
+                                            <input type="hidden" name="dataset" value="ai_logs">
+                                            <button type="submit" class="btn btn-xs btn-default"><i class="fas fa-download"></i> Export CSV</button>
+                                        </form>
+                                    </div>
                                 </div>
                                 <div class="card-body">
                                     <div class="table-responsive">
-                                        <table class="table table-hover neko-table">
+                                        <table id="nekoActivityTable" class="table table-hover neko-table">
                                             <thead>
                                                 <tr>
                                                     <th>Ticket ID</th>
@@ -1190,6 +1291,7 @@ function display_admin_interface($vars)
                                                     <th>AI Response</th>
                                                     <th>Confidence</th>
                                                     <th>Mood</th>
+                                                    <th>Feedback</th>
                                                     <th>Date</th>
                                                 </tr>
                                             </thead>
@@ -1214,6 +1316,15 @@ function display_admin_interface($vars)
                                                                 class="mood-badge mood-<?php echo strtolower($log->mood_detected); ?>">
                                                                 <?php echo $log->mood_detected; ?>
                                                             </span>
+                                                        </td>
+                                                        <td>
+                                                            <?php if (!empty($log->admin_feedback)): ?>
+                                                                <span class="label label-<?php echo $log->admin_feedback === 'positive' ? 'success' : 'warning'; ?>">
+                                                                    <?php echo $log->admin_feedback === 'positive' ? 'Helpful' : 'Needs Work'; ?>
+                                                                </span>
+                                                            <?php else: ?>
+                                                                <span style="color:#94a3b8;">-</span>
+                                                            <?php endif; ?>
                                                         </td>
                                                         <td><?php echo date('M j, H:i', strtotime($log->created_at)); ?></td>
                                                     </tr>
@@ -1491,12 +1602,20 @@ function display_admin_interface($vars)
                         <!-- Agent Actions Tab -->
                         <div role="tabpanel" class="tab-pane" id="agent-actions">
                             <div class="neko-card">
-                                <div class="card-header">
-                                    <h4><i class="fas fa-tools"></i> Autonomous Agent Tool &amp; Action Audit Log (Last 100)</h4>
+                                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                                    <h4 style="margin:0;"><i class="fas fa-tools"></i> Autonomous Agent Tool &amp; Action Audit Log (Last 100)</h4>
+                                    <div style="display:flex; gap:8px; align-items:center;">
+                                        <input type="text" class="form-control input-sm" placeholder="Filter by ticket or tool..." onkeyup="nekoFilterTable(this, 'nekoAgentActionsTable')" style="width:210px;">
+                                        <form method="post" style="margin:0;">
+                                            <input type="hidden" name="action" value="export_csv">
+                                            <input type="hidden" name="dataset" value="agent_actions">
+                                            <button type="submit" class="btn btn-xs btn-default"><i class="fas fa-download"></i> Export CSV</button>
+                                        </form>
+                                    </div>
                                 </div>
                                 <div class="card-body">
                                     <div class="table-responsive">
-                                        <table class="table table-hover neko-table">
+                                        <table id="nekoAgentActionsTable" class="table table-hover neko-table">
                                             <thead>
                                                 <tr>
                                                     <th>Ticket</th>
@@ -2725,6 +2844,15 @@ function display_admin_interface($vars)
                 }
             });
         });
+
+        function nekoFilterTable(inputEl, tableId) {
+            var q = (inputEl.value || '').toLowerCase();
+            var rows = document.querySelectorAll('#' + tableId + ' tbody tr');
+            rows.forEach(function(row) {
+                var txt = (row.textContent || '').toLowerCase();
+                row.style.display = (!q || txt.indexOf(q) !== -1) ? '' : 'none';
+            });
+        }
 
         function nekoOpenTab(tabId) {
             var tabLink = document.querySelector('.neko-tabs .nav-tabs a[href="#' + tabId + '"]');

@@ -260,7 +260,7 @@ add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
                     'custom_prompt' => $custom_prompt,
                 ]);
                 if (!empty($ai_response['success'])) {
-                    Capsule::table('mod_gemini_ai_logs')->insert([
+                    $log_id = Capsule::table('mod_gemini_ai_logs')->insertGetId([
                         'ticket_id' => $ticket_id,
                         'user_message' => substr((string) $latest_message, 0, 2000),
                         'ai_response' => $ai_response['response'] ?? '',
@@ -269,6 +269,7 @@ add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
                         'response_type' => $mode,
                         'created_at' => date('Y-m-d H:i:s'),
                     ]);
+                    $ai_response['log_id'] = (int) $log_id;
                 }
             } else {
                 // For thread-level modes (summarize, triage, generate_kb, internal_handover), pass the full thread
@@ -363,6 +364,21 @@ add_hook('AdminAreaHeaderOutput', 1, function ($vars) {
             ob_clean();
             header('Content-Type: application/json');
             echo json_encode(['success' => true]);
+            exit;
+        }
+
+        if ($action == 'neko_submit_ai_feedback') {
+            neko_ensure_agent_tables();
+            $log_id = (int) ($_POST['log_id'] ?? 0);
+            $rating = $_POST['rating'] === 'positive' ? 'positive' : 'negative';
+            if ($log_id > 0) {
+                Capsule::table('mod_gemini_ai_logs')->where('id', $log_id)->update([
+                    'admin_feedback' => $rating,
+                ]);
+            }
+            ob_clean();
+            header('Content-Type: application/json');
+            echo json_encode(['success' => $log_id > 0, 'rating' => $rating]);
             exit;
         }
     }
@@ -565,14 +581,25 @@ function generateAIResponse(mode, lang) {
                 updateMoodDisplay(response.mood, response.confidence, response.escalation_level || 0);
             }
 
-            if ((response.tools_trace && response.tools_trace.length > 0) || response.internal_note || response.needs_human) {
-                var html = '<strong><i class="fas fa-microscope"></i> Neko Agent Diagnostics:</strong>';
+            if ((response.tools_trace && response.tools_trace.length > 0) || response.internal_note || response.needs_human || response.log_id) {
+                var html = '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">';
+                html += '<div><strong><i class="fas fa-microscope"></i> Neko Agent Diagnostics:</strong>';
+                if (response.model_used) {
+                    html += ' <span class="label label-default">' + nekoEscapeHtml(response.model_used) + (response.tokens_used ? ' · ' + response.tokens_used + ' tok' : '') + '</span>';
+                }
                 if (response.needs_human) {
                     html += ' <span class="label label-danger">Human Intervention Recommended</span>';
                     if (response.escalation_reason) {
                         html += ' <span style="color:#c0392b;">(' + nekoEscapeHtml(response.escalation_reason) + ')</span>';
                     }
                 }
+                html += '</div>';
+                if (response.log_id) {
+                    html += '<div id="nekoFeedbackWrap"><small style="color:#64748b; margin-right:4px;">Rate draft:</small>' +
+                        '<button type="button" class="btn btn-xs btn-default" onclick="nekoRateDraft(' + response.log_id + ', \'positive\')"><i class="fas fa-thumbs-up text-success"></i> Helpful</button> ' +
+                        '<button type="button" class="btn btn-xs btn-default" onclick="nekoRateDraft(' + response.log_id + ', \'negative\')"><i class="fas fa-thumbs-down text-danger"></i> Needs Work</button></div>';
+                }
+                html += '</div>';
                 if (response.internal_note) {
                     html += '<div style="margin-top:5px; color:#1f2937;">' + nekoEscapeHtml(response.internal_note) + '</div>';
                 }
@@ -596,6 +623,22 @@ function generateAIResponse(mode, lang) {
         if (!isStaffOnly) nekoSetReplyText(originalContent);
         alert('Could not communicate with the AI module. Please try again.');
     });
+}
+
+function nekoRateDraft(logId, rating) {
+    $.post('supporttickets.php', {
+        action: 'neko_submit_ai_feedback',
+        ticket_id: __TICKET_ID__,
+        log_id: logId,
+        rating: rating
+    }, function(res) {
+        if (res && res.success) {
+            var label = rating === 'positive'
+                ? '<span class="label label-success"><i class="fas fa-check"></i> Rated Helpful</span>'
+                : '<span class="label label-warning"><i class="fas fa-flag"></i> Flagged for Review</span>';
+            $('#nekoFeedbackWrap').html(label);
+        }
+    }, 'json');
 }
 
 function nekoRunQuickDomainDiag(domain) {
@@ -1539,6 +1582,7 @@ function get_gemini_config()
         // Core API Settings
         'gemini_api_key' => $settings['gemini_api_key'] ?? '',
         'gemini_model' => !empty($settings['gemini_model']) ? trim($settings['gemini_model']) : 'gemini-2.5-flash',
+        'gemini_fallback_model' => !empty($settings['gemini_fallback_model']) ? trim($settings['gemini_fallback_model']) : '',
         'assistant_name' => !empty($settings['assistant_name']) ? $settings['assistant_name'] : 'AI Support',
         'auto_reply_enabled' => $isOn('auto_reply_enabled', true),
         'confidence_threshold' => (float) ($settings['confidence_threshold'] ?? 0.7),
@@ -2854,7 +2898,7 @@ function call_gemini_api($prompt, $config, $context = 'ticket_reply', $ticket_id
         ]
     ];
 
-    $res = neko_gemini_http_post($model, $api_key, $payload, $ticket_id);
+    $res = neko_gemini_http_post($model, $api_key, $payload, $ticket_id, $config['gemini_fallback_model'] ?? '');
     if (empty($res['success'])) {
         return [
             'success' => false,
@@ -2892,7 +2936,7 @@ function call_gemini_api($prompt, $config, $context = 'ticket_reply', $ticket_id
 
 
 
-function log_api_call($endpoint, $request_data, $response_data, $http_code, $curl_error, $response_time, $ticket_id = null, $status = 'success', $error_details = null)
+function log_api_call($endpoint, $request_data, $response_data, $http_code, $curl_error, $response_time, $ticket_id = null, $status = 'success', $error_details = null, $model_used = null, $tokens_used = 0)
 {
     $config = get_gemini_config();
 
@@ -2901,18 +2945,36 @@ function log_api_call($endpoint, $request_data, $response_data, $http_code, $cur
     }
 
     try {
-        Capsule::table('mod_gemini_api_logs')->insert([
-            'api_endpoint' => $endpoint,
-            'request_data' => is_array($request_data) ? json_encode($request_data, JSON_PRETTY_PRINT) : $request_data,
-            'response_data' => is_array($response_data) ? json_encode($response_data, JSON_PRETTY_PRINT) : (string) $response_data,
-            'http_code' => $http_code,
+        neko_ensure_agent_tables();
+        $safe_endpoint = function_exists('neko_redact_secrets') ? neko_redact_secrets((string) $endpoint) : (string) $endpoint;
+        $req_str = is_array($request_data) ? json_encode($request_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) : (string) $request_data;
+        $res_str = is_array($response_data) ? json_encode($response_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) : (string) $response_data;
+        if (function_exists('neko_redact_secrets')) {
+            $req_str = neko_redact_secrets($req_str);
+            $res_str = neko_redact_secrets($res_str);
+        }
+
+        $row = [
+            'api_endpoint' => substr($safe_endpoint, 0, 255),
+            'request_data' => $req_str,
+            'response_data' => $res_str,
+            'http_code' => (int) $http_code,
             'curl_error' => $curl_error,
             'response_time' => $response_time,
             'ticket_id' => $ticket_id,
             'status' => $status,
-            'error_details' => $error_details,
-            'created_at' => date('Y-m-d H:i:s')
-        ]);
+            'error_details' => $error_details ? (function_exists('neko_redact_secrets') ? neko_redact_secrets((string) $error_details) : (string) $error_details) : null,
+            'created_at' => date('Y-m-d H:i:s'),
+        ];
+
+        if (Capsule::schema()->hasColumn('mod_gemini_api_logs', 'model_used')) {
+            $row['model_used'] = $model_used ? substr((string) $model_used, 0, 80) : null;
+        }
+        if (Capsule::schema()->hasColumn('mod_gemini_api_logs', 'tokens_used')) {
+            $row['tokens_used'] = (int) $tokens_used;
+        }
+
+        Capsule::table('mod_gemini_api_logs')->insert($row);
     } catch (Exception $e) {
         logActivity("Gemini AI Assistant: Failed to log API call - " . $e->getMessage());
     }
